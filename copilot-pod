@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ANSI color codes for consistent error formatting
+BOLD=$'\e[1m'; RED=$'\e[31m'; RESET=$'\e[0m'
+[[ -t 1 ]] || { BOLD=; RED=; RESET=; }
+err() { printf '%s✗%s %s\n' "$RED" "$RESET" "$*" >&2; }
+die() { err "$*"; exit 1; }
+
+# --help / -h: print copy-pastable usage and exit BEFORE any Docker work, so help still works when
+# Docker is down or the image isn't built yet. We resolve our own location so every command printed
+# below is copy-pastable as-is — no matter where the repo was cloned or whether the alias is set up.
+if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
+  HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  row() { printf '  %-18s %s%s%s\n' "$1" "$BOLD" "$2" "$RESET"; }
+  printf '%scopilot-pod%s — run Copilot CLI in a Docker sandbox scoped to the current folder.\n' "$BOLD" "$RESET"
+  printf '\n%sRun%s  (cd into your project first — the current folder is what gets mounted):\n' "$BOLD" "$RESET"
+  row "Open a shell:"   "$HERE/copilot-pod"
+  row "Run Copilot:"     "$HERE/copilot-pod copilot --yolo"
+  printf '\n%sManage%s  (works from any folder):\n' "$BOLD" "$RESET"
+  row "Install/update:" "$HERE/install.sh"
+  row "Pin a version:"  "COPILOT_CLI_VERSION=2.0.0 $HERE/install.sh"
+  row "Uninstall:"      "$HERE/uninstall.sh"
+  printf '\n%sOptions%s  (prefix any run command):\n' "$BOLD" "$RESET"
+  row "Publish ports:"  "PORTS=\"3000 5173\" $HERE/copilot-pod"
+  row "Isolate/limit:"  "NET=none MEMORY=4g PIDS=512 $HERE/copilot-pod"
+  printf '\n'
+  row "Shortcut alias:" "alias copilot-pod=$HERE/copilot-pod"
+  row "Full README:"    "https://github.com/alfsch/copilot-pod"
+  exit 0
+fi
+
+# Preflight checks, in causal order. Without these the failures surface as cryptic Docker errors:
+#   - daemon down -> the image check below would falsely blame a missing image.
+#   - missing image -> Docker would try to pull 'copilot-pod' from Docker Hub and fail.
+# We probe existence with `image ls -q`, not `image inspect`: it resolves the name the same way
+# `docker run` does, so the check can't disagree with whether the run will actually work. (Some
+# Docker Desktop builds have a broken `image inspect <name>` that false-negatives on a present
+# image, which would otherwise wrongly send you to re-run install.sh.)
+command -v docker >/dev/null || die "Docker is required but not on PATH."
+docker info >/dev/null 2>&1 || die "Docker daemon is not running."
+if [ -z "$(docker image ls -q copilot-pod 2>/dev/null)" ]; then
+  SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  err "Image 'copilot-pod' not found."
+  die "Please run '${BOLD}${SCRIPT_DIR}/install.sh${RESET}' first to build the local container."
+fi
+
+# Auto-update on every start: if the image was built from the "latest" channel (label set by
+# install.sh) and npm's current latest differs from what's installed, rebuild via install.sh before
+# launching. Images pinned to a version are left alone, as are images built before
+# the labels existed (re-run install.sh once to opt in). The check is best-effort: a slow/offline
+# registry (3s cap) or a failed rebuild only prints a note and continues with the existing image.
+# Set COPILOT_POD_NO_UPDATE=1 to skip it. Output goes to stderr so piped stdout stays clean.
+if [ -z "${COPILOT_POD_NO_UPDATE:-}" ] && command -v curl >/dev/null; then
+  # Inspect by image ID (found via `image ls -q`, like the preflight above), not by name — see the
+  # Docker Desktop note there. A failed lookup leaves the labels empty, which just skips the update.
+  _image_id="$(docker image ls -q copilot-pod:latest 2>/dev/null | head -n1 || true)"
+  _label() { [ -n "$_image_id" ] && docker image inspect --format "{{index .Config.Labels \"$1\"}}" "$_image_id" 2>/dev/null || true; }
+  if [ "$(_label copilot-pod.channel)" = "latest" ]; then
+    _installed="$(_label copilot-pod.version)"
+    # If install.sh couldn't resolve "latest" at build time, the label holds the literal tag; ask the
+    # image for the real version so an up-to-date image isn't needlessly rebuilt.
+    if [[ ! "$_installed" =~ ^[0-9] ]]; then
+      _installed="$(docker run --rm copilot-pod copilot --version 2>/dev/null | sed -n 's/^\([0-9][0-9.]*\).*/\1/p' || true)"
+    fi
+    _latest="$(curl -fsSL --max-time 3 https://registry.npmjs.org/-/package/@github/copilot/dist-tags 2>/dev/null \
+      | sed -n 's/.*"latest"[[:space:]]*:[[:space:]]*"\([0-9][^"]*\)".*/\1/p' || true)"
+    if [ -n "$_latest" ] && [ "$_latest" != "$_installed" ]; then
+      printf '%s●%s New Copilot CLI %s (installed: %s) — updating image...\n' "$BOLD" "$RESET" "$_latest" "${_installed:-unknown}" >&2
+      # Force latest: an exported COPILOT_CLI_VERSION must not turn this into a pinned image.
+      COPILOT_CLI_VERSION=latest "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/install.sh" >&2 \
+        || err "Update failed; continuing with the existing image."
+    fi
+  fi
+fi
+
+# Host-side state dir: persists Copilot's auth + history across container restarts.
+mkdir -p "$HOME/.copilot-pod"
+
+# Copilot reads its main config from $HOME/.copilot.json (a file at HOME, sibling to the .copilot/
+# directory). We bind-mount this file separately so login state survives. Two quirks:
+#   - Docker creates a directory at the target if the source path is missing, so the file must
+#     pre-exist on the host before `docker run`.
+#   - Copilot treats an empty file as a JSON parse error, not as "no config", so we seed it with {}.
+[ -s "$HOME/.copilot-pod/.copilot.json" ] || printf '{}' > "$HOME/.copilot-pod/.copilot.json"
+
+# Restrict to owner-only. The directory holds the Copilot/GitHub auth token and session transcripts
+# (which can contain code, file contents, and command output Copilot saw); on multi-user hosts the
+# default 755/644 modes would let other local users read both. Matches the convention used for
+# ~/.ssh, ~/.aws, ~/.gnupg.
+chmod 700 "$HOME/.copilot-pod"
+chmod 600 "$HOME/.copilot-pod/.copilot.json"
+
+# Mounts & Users:
+#   --user -> dynamic                            Runs container exactly as the host user to prevent permission issues.
+#   HOME=/home/copilot-pod                        Because user is dynamic, we use a dedicated writable home dir.
+#   $PWD -> $PWD                                 project files; same path on both sides keeps file
+#                                                references (logs, errors, tool output) consistent
+#                                                between host and container.
+#   ~/.copilot-pod -> /home/copilot-pod/.copilot    credentials, sessions, history (the .copilot dir).
+#   ~/.copilot-pod/.copilot.json -> ditto          account binding + project trust state (sibling file).
+# TTY Detection:
+#   If we pipe data into the script (e.g. `cat file | copilot-pod`), input is not a terminal.
+#   Passing `-t` to Docker in this case would cause a crash.
+#   [ -t 0 ] checks if STDIN is a terminal. If yes, keep it interactive (-i).
+#   [ -t 1 ] checks if STDOUT is a terminal. If yes, allocate a pseudo-TTY (-t).
+DOCKER_FLAGS=("--rm")
+[ -t 0 ] && DOCKER_FLAGS+=("-i")
+[ -t 1 ] && DOCKER_FLAGS+=("-t")
+
+# Optional Port Mapping:
+#   Allows users to map dev servers by passing PORTS="3000 8080:80".
+#   We force binding to 127.0.0.1 to prevent exposing dev servers to public networks.
+#   Each entry must be either "PORT" or "HOST:CONTAINER", with both parts in the 1-65535 range.
+#   We validate up front so a typo surfaces as a clear error here rather than a cryptic Docker failure.
+if [ -n "${PORTS:-}" ]; then
+  for port in $PORTS; do
+    if [[ ! "$port" =~ ^[0-9]+(:[0-9]+)?$ ]]; then
+      die "PORTS entry '$port' is invalid; expected 'PORT' or 'HOST:CONTAINER' (digits only)."
+    fi
+    # Range-check each numeric component. 10# forces base-10 so "08"/"09" don't parse as octal.
+    IFS=':' read -ra _port_parts <<< "$port"
+    for _n in "${_port_parts[@]}"; do
+      if (( 10#$_n < 1 || 10#$_n > 65535 )); then
+        die "PORTS entry '$port' has '$_n' outside the 1-65535 range."
+      fi
+    done
+    if [[ "$port" == *":"* ]]; then
+      DOCKER_FLAGS+=("-p" "127.0.0.1:${port}")
+    else
+      DOCKER_FLAGS+=("-p" "127.0.0.1:${port}:${port}")
+    fi
+  done
+fi
+
+# Optional Network Isolation:
+#   By default the container has unrestricted outbound networking — Copilot needs GitHub's Copilot API
+#   (api.github.com, api.githubcopilot.com), and your builds need the npm/pip/etc. registries. Set NET=none to cut ALL networking for the run.
+#   Use this to inspect or build code from an untrusted source offline: with no network, a malicious
+#   payload can't exfiltrate the project or phone home. Note that Copilot itself can't reach GitHub
+#   in this mode, so it's for sandboxed shell/build work, not for a live Copilot session.
+#   NET=none and PORTS are mutually exclusive — you can't publish a port on a container with no network.
+if [ "${NET:-}" = "none" ]; then
+  [ -n "${PORTS:-}" ] && die "NET=none and PORTS are mutually exclusive: a no-network container can't publish ports."
+  DOCKER_FLAGS+=("--network=none")
+fi
+
+# Resource Limits (host availability):
+#   Dropping capabilities does NOT stop fork() or memory allocation, so a runaway or malicious
+#   process inside the container can still fork-bomb or exhaust memory and drag the host down.
+#   --pids-limit caps total processes/threads. The default is generous enough for normal builds;
+#     raise it with PIDS= for very parallel builds, or lower it when running untrusted code.
+#   MEMORY/CPUS are opt-in with no default on purpose: a fixed memory cap would OOM-kill legitimate
+#     large builds, and the right ceiling depends on your host's RAM. Set e.g. MEMORY=4g CPUS=2
+#     when running code you don't trust.
+DOCKER_FLAGS+=("--pids-limit=${PIDS:-4096}")
+[ -n "${MEMORY:-}" ] && DOCKER_FLAGS+=("--memory=$MEMORY")
+[ -n "${CPUS:-}" ]   && DOCKER_FLAGS+=("--cpus=$CPUS")
+
+# Hardening:
+#   --cap-drop=ALL                       Drop all Linux capabilities. An interactive dev shell
+#                                        as an unprivileged user needs none; this closes off
+#                                        capability-based escalation paths (CAP_NET_RAW, etc.)
+#                                        and shrinks the surface for known container-escape CVEs.
+#   --security-opt=no-new-privileges     Set NO_NEW_PRIVS on the process tree. Even if a setuid
+#                                        binary in the image (passwd, su, mount, ...) ever has
+#                                        a local-root vulnerability, it cannot elevate.
+#
+# COLORTERM is forwarded so Copilot CLI's TUI can emit full 24-bit color when the host terminal
+# supports it. Bare `-e COLORTERM` (no value) passes the host's setting through — "truecolor" on
+# iTerm2, VS Code, WezTerm, etc., or nothing when the host doesn't advertise it, so a non-truecolor
+# terminal is never forced into colors it can't render. Without this, docker leaves the container at
+# TERM=xterm with no COLORTERM and supports-color downshifts the whole UI to 16 colors.
+#
+# COPILOT_AUTO_UPDATE=false turns off Copilot CLI's built-in self-updater. Inside the container it can't
+# work (the unprivileged runtime user has no write access to the root-owned npm prefix, so it only prints
+# "Auto-update failed"), and updates are handled by rebuilding the image instead: the start-up check
+# above for the latest channel, or install.sh for a pinned version.
+#
+# COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN are forwarded only when set on the host (bare -e),
+# for token-based login instead of the interactive /login. They take precedence over stored
+# credentials, and they also authenticate `gh` inside the container.
+exec docker run "${DOCKER_FLAGS[@]}" \
+  --cap-drop=ALL \
+  --security-opt=no-new-privileges \
+  --user "$(id -u):$(id -g)" \
+  -e HOME=/home/copilot-pod \
+  -e COLORTERM \
+  -e COPILOT_AUTO_UPDATE=false \
+  -e COPILOT_GITHUB_TOKEN \
+  -e GH_TOKEN \
+  -e GITHUB_TOKEN \
+  -v "$PWD:$PWD" \
+  -w "$PWD" \
+  -v "$HOME/.copilot-pod:/home/copilot-pod/.copilot" \
+  -v "$HOME/.copilot-pod/.copilot.json:/home/copilot-pod/.copilot.json" \
+  copilot-pod "$@"
