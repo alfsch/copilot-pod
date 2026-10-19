@@ -88,8 +88,8 @@ echo
 
 info "Next steps"
 printf '  cd into your work-in-progress project folder first, then:\n'
-printf '    Open shell in pod:        %s%s/copilot-pod%s\n' "$BOLD" "$REPO_DIR" "$RESET"
-printf '    Or run Copilot directly:   %s%s/copilot-pod copilot --yolo%s\n' "$BOLD" "$REPO_DIR" "$RESET"
-printf '    With Docker inside the pod: %sDOCKER=1 %s/copilot-pod%s\n' "$BOLD" "$REPO_DIR" "$RESET"
-printf '    Docker + Copilot directly: %sDOCKER=1 %s/copilot-pod copilot --yolo%s\n' "$BOLD" "$REPO_DIR" "$RESET"
-printf '    Optional shell alias:     %salias copilot-pod=%s/copilot-pod%s\n' "$BOLD" "$REPO_DIR" "$RESET"
+printf '    Open shell in pod:          %s%s/copilot-pod%s\n' "$BOLD" "$REPO_DIR" "$RESET"
+printf '    Or run Copilot directly:     %s%s/copilot-pod copilot --yolo%s\n' "$BOLD" "$REPO_DIR" "$RESET"
+printf '    Shell with Docker:           %sDOCKER=1 %s/copilot-pod%s\n' "$BOLD" "$REPO_DIR" "$RESET"
+printf '    Copilot with Docker:        %sDOCKER=1 %s/copilot-pod copilot --yolo%s\n' "$BOLD" "$REPO_DIR" "$RESET"
+printf '    Optional shell alias:       %salias copilot-pod=%s/copilot-pod%s\n' "$BOLD" "$REPO_DIR" "$RESET"
