@@ -53,7 +53,7 @@ info "Removing Docker cache volumes"
 _all="$(docker volume ls -q --filter name=copilot-pod-docker- 2>/dev/null)" \
   || die "Could not list Docker volumes (is the Docker daemon running?). The host directory was not removed."
 # --filter name= matches substrings, so keep only the names the launcher generates.
-_vols="$(grep -E '^copilot-pod-docker-[0-9]+$' <<<"$_all" || true)"
+_vols="$(grep -E '^copilot-pod-docker-[0-9a-f]{16}$' <<<"$_all" || true)"
 if [ -n "$_vols" ]; then
   # shellcheck disable=SC2086
   docker volume rm -f $_vols >/dev/null 2>&1 || die "Some cache volumes are in use; close running sessions and retry. The host directory was not removed."
