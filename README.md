@@ -193,11 +193,11 @@ Add `DOCKER_CACHE=1` to keep the sidecar's images, layers and volumes between se
 DOCKER=1 DOCKER_CACHE=1 copilot-pod
 ```
 
-- The data lives in a Docker named volume `copilot-pod-docker-<hash of the state directory>-<hash of the project path>`, one per project and state directory (so users sharing a Docker daemon never touch each other's caches). It is not a host folder: overlay storage doesn't work on macOS/Windows file shares, and the directory has to be owned by the sidecar's uid 1000.
+- The data lives in a Docker named volume `copilot-pod-docker-<hash of the project path>`, one per project. It is not a host folder: overlay storage doesn't work on macOS/Windows file shares, and the directory has to be owned by the sidecar's uid 1000.
 - On startup you'll see either `Docker cache: created new ...` or `Docker cache: reusing ... (N images, SIZE)`, so you can tell at a glance whether the cache is working.
 - Only one session per project can use the cache at a time; a second one stops with a message. Run it without `DOCKER_CACHE=1` for a throwaway daemon alongside.
 - **Security trade-off:** whatever a session pulled or built, including anything malicious or secret, is still there in the next one. Skip it for untrusted code.
-- Caches that haven't been used for 90 days are removed automatically the next time any project starts with `DOCKER_CACHE=1`. Change the limit with `DOCKER_CACHE_MAX_AGE_DAYS=30`, or disable it with `DOCKER_CACHE_MAX_AGE_DAYS=0`. Docker doesn't track volume usage itself, so last-use times are kept in `~/.local/state/copilot-pod/docker-cache-usage` (or under `$XDG_STATE_HOME`). It is deliberately outside `~/.copilot-pod/`, so the pod can't see or alter it.
+- Caches that haven't been used for 90 days are removed automatically the next time any project starts with `DOCKER_CACHE=1`. Change the limit with `DOCKER_CACHE_MAX_AGE_DAYS=30`, or disable it with `DOCKER_CACHE_MAX_AGE_DAYS=0`. Docker doesn't track volume usage itself, so each cache gets an empty marker file whose modification time is its last use, in `~/.local/state/copilot-pod/caches/` (or under `$XDG_STATE_HOME`). That is deliberately outside `~/.copilot-pod/`, so the pod can't see or alter it.
 - Otherwise the cache grows until you clean it. Inspect with `docker volume ls --filter name=copilot-pod-docker-`, delete one with `docker volume rm <name>`; `uninstall.sh` removes them all.
 
 ### Pasting images and screenshots
@@ -299,7 +299,7 @@ PIDS=512 copilot-pod
 Everything this repo causes to exist outside the project you launch it from:
 
 - `~/.copilot-pod/` on your host — auth token, settings, and per-project session/conversation history (transcripts can include code snippets and command output Copilot saw). Auth and settings are shared across projects (one login, ever); session history lives under `~/.copilot-pod/session-state/`, and account/trust state in `~/.copilot-pod/.copilot.json`. This is *not* a host Copilot install; it's a state directory for the container's Copilot, kept on the host so it survives restarts.
-- Docker image `copilot-pod` and its layers, plus the `node:24-slim` base image, in Docker's image store. With `DOCKER_CACHE=1`, also one `copilot-pod-docker-*` volume per project. The last-use times for pruning them are kept in `~/.local/state/copilot-pod/` (the only host path outside `~/.copilot-pod/`, created only with `DOCKER_CACHE=1`).
+- Docker image `copilot-pod` and its layers, plus the `node:24-slim` base image, in Docker's image store. With `DOCKER_CACHE=1`, also one `copilot-pod-docker-*` volume per project. The last-use markers for pruning them are kept in `~/.local/state/copilot-pod/caches/` (the only host path outside `~/.copilot-pod/`, created only with `DOCKER_CACHE=1`).
 - Docker build cache from `apt-get` and `npm install` steps.
 - Outbound network during build: Docker Hub, Debian apt mirrors, npm registry. During runtime: `the GitHub Copilot API` and whatever your project code reaches (network is unrestricted).
 - While a session is running: one container process, and any ports you explicitly mapped via `PORTS` bound on `127.0.0.1`.
