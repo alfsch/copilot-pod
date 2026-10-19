@@ -25,6 +25,7 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
   row "Publish ports:"  "PORTS=\"3000 5173\" $HERE/copilot-pod"
   row "Isolate/limit:"  "NET=none MEMORY=4g PIDS=512 $HERE/copilot-pod"
   row "Docker access:"  "DOCKER=1 $HERE/copilot-pod"
+  row "Keep Docker cache:" "DOCKER=1 DOCKER_CACHE=1 $HERE/copilot-pod"
   printf '\n'
   row "Shortcut alias:" "alias copilot-pod=$HERE/copilot-pod"
   row "Full README:"    "https://github.com/alfsch/copilot-pod"
@@ -170,7 +171,13 @@ DOCKER_FLAGS+=("--pids-limit=${PIDS:-4096}")
 #   - $PWD is mounted into the sidecar at the same path so `docker run -v "$PWD:..."` resolves. The
 #     sidecar user is uid 1000, so on hosts where your uid differs, inner containers may not be able
 #     to write to the project.
-#   - Images, containers and volumes of the inner daemon vanish when the session ends.
+#   - Images, containers and volumes of the inner daemon vanish when the session ends, unless
+#     DOCKER_CACHE=1: then the daemon's data dir lives in a named volume (copilot-pod-docker-<hash of
+#     $PWD>, one per project) and image layers are reused across sessions. A named volume, not a host
+#     folder, because overlay storage doesn't work on macOS/Windows file shares and the dir must be
+#     owned by the sidecar's uid 1000. Only one session per project may use it at a time, since two
+#     dockerd instances can't share a data dir. Trade-off: whatever a session pulled or built (including
+#     anything malicious or secret) is still there next time; uninstall.sh removes these volumes.
 #   - Ports published by inner containers live on the sidecar's network, not on the host.
 #   The sidecar image is pinned by digest (kept current by Renovate). Override it with DIND_IMAGE=...
 DIND_IMAGE="${DIND_IMAGE:-docker:28-dind-rootless@sha256:7c3e797187e43738220462658f4586572cbd3bf009f728b21e34d9c5c06ce431}"
@@ -179,6 +186,7 @@ cleanup_dind() {
   docker network rm "$DIND_NET" >/dev/null 2>&1 || true
   docker volume rm "$DIND_CERTS" >/dev/null 2>&1 || true
 }
+[ -n "${DOCKER_CACHE:-}" ] && [ -z "${DOCKER:-}" ] && die "DOCKER_CACHE=1 only works together with DOCKER=1."
 if [ -n "${DOCKER:-}" ]; then
   [ "${NET:-}" = "none" ] && die "DOCKER=1 and NET=none are mutually exclusive: the pod needs a network to reach its Docker daemon."
   DIND_NAME="copilot-pod-dind-$$"
@@ -187,6 +195,16 @@ if [ -n "${DOCKER:-}" ]; then
   trap cleanup_dind EXIT
   docker network create "$DIND_NET" >/dev/null || die "Could not create network for the Docker sidecar."
   docker volume create "$DIND_CERTS" >/dev/null || die "Could not create certificate volume for the Docker sidecar."
+  DIND_DATA_FLAGS=()
+  if [ -n "${DOCKER_CACHE:-}" ]; then
+    # cksum is POSIX, so this hashes the same way on Linux and macOS.
+    _hash="$(printf '%s' "$PWD" | cksum | cut -d' ' -f1)"
+    DIND_CACHE_VOL="copilot-pod-docker-$_hash"
+    if [ -n "$(docker ps -q --filter "volume=$DIND_CACHE_VOL" 2>/dev/null)" ]; then
+      die "The Docker cache for this project is in use by another session. Close it or run without DOCKER_CACHE=1."
+    fi
+    DIND_DATA_FLAGS=(-v "$DIND_CACHE_VOL:/home/rootless/.local/share/docker")
+  fi
   docker run -d --rm --privileged \
     --name "$DIND_NAME" --network "$DIND_NET" --network-alias dind \
     --pids-limit="${PIDS:-4096}" \
@@ -194,6 +212,7 @@ if [ -n "${DOCKER:-}" ]; then
     -e DOCKER_TLS_CERTDIR=/certs \
     -e DOCKER_TLS_SAN=DNS:dind \
     -v "$DIND_CERTS:/certs" \
+    ${DIND_DATA_FLAGS[@]+"${DIND_DATA_FLAGS[@]}"} \
     -v "$PWD:$PWD" \
     "$DIND_IMAGE" >/dev/null || die "Could not start the Docker sidecar ($DIND_IMAGE)."
   printf '%s●%s Starting Docker sidecar...\n' "$BOLD" "$RESET" >&2

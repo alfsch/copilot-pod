@@ -17,6 +17,7 @@ IMAGE="copilot-pod"
 info "Will remove"
 printf '  %simage:%s %s\n' "$DIM" "$RESET" "$IMAGE"
 printf '  %sdir:  %s %s %s(auth + session history)%s\n' "$DIM" "$RESET" "$STATE_DIR" "$DIM" "$RESET"
+printf '  %svolumes:%s copilot-pod-docker-* %s(DOCKER_CACHE image caches, if any)%s\n' "$DIM" "$RESET" "$DIM" "$RESET"
 echo
 
 info "Will NOT remove"
@@ -43,6 +44,17 @@ if [ -n "$(docker image ls -q "$IMAGE" 2>/dev/null)" ]; then
   ok "Image '$IMAGE' removed"
 else
   ok "Image '$IMAGE' was not present"
+fi
+echo
+
+info "Removing Docker cache volumes"
+_vols="$(docker volume ls -q --filter name=copilot-pod-docker- 2>/dev/null || true)"
+if [ -n "$_vols" ]; then
+  # shellcheck disable=SC2086
+  docker volume rm -f $_vols >/dev/null 2>&1 || err "Some cache volumes are in use; close running sessions and retry."
+  ok "Removed Docker cache volumes"
+else
+  ok "No Docker cache volumes present"
 fi
 echo
 
