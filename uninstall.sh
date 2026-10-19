@@ -48,18 +48,21 @@ fi
 echo
 
 info "Removing Docker cache volumes"
-# --filter name= matches substrings, so keep only the names the launcher generates.
-# A failed listing must not look like "no caches", or the stamps would be deleted below.
-_all="$(docker volume ls -q --filter name=copilot-pod-docker- 2>/dev/null)" \
-  || die "Could not list Docker volumes (is the Docker daemon running?). The host directory was not removed."
-# --filter name= matches substrings, so keep only the names the launcher generates.
-_vols="$(grep -E '^copilot-pod-docker-[0-9a-f]{16}$' <<<"$_all" || true)"
-if [ -n "$_vols" ]; then
-  # shellcheck disable=SC2086
-  docker volume rm -f $_vols >/dev/null 2>&1 || die "Some cache volumes are in use; close running sessions and retry. The host directory was not removed."
-  ok "Removed Docker cache volumes"
+if command -v docker >/dev/null; then
+  # A failed listing must not look like "no caches", or the stamps would be deleted below.
+  _all="$(docker volume ls -q --filter name=copilot-pod-docker- 2>/dev/null)" \
+    || die "Could not list Docker volumes (is the Docker daemon running?). The host directory was not removed."
+  # --filter name= matches substrings, so keep only the names the launcher generates.
+  _vols="$(grep -E '^copilot-pod-docker-[0-9a-f]{16}$' <<<"$_all" || true)"
+  if [ -n "$_vols" ]; then
+    # shellcheck disable=SC2086
+    docker volume rm $_vols >/dev/null 2>&1 || die "Some cache volumes are in use; close running sessions and retry. The host directory was not removed."
+    ok "Removed Docker cache volumes"
+  else
+    ok "No Docker cache volumes present"
+  fi
 else
-  ok "No Docker cache volumes present"
+  ok "Docker is not installed; no cache volumes to remove"
 fi
 # The last-use stamps go regardless of volumes: they can outlive volumes that were deleted by hand.
 rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/copilot-pod"

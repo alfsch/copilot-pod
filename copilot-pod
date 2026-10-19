@@ -221,6 +221,10 @@ cleanup_dind() {
   docker network rm "$DIND_NET" >/dev/null 2>&1 || true
   docker volume rm "$DIND_CERTS" >/dev/null 2>&1 || true
 }
+# Only 1 (or unset) is accepted: DOCKER=0 or DOCKER_CACHE=false must not start a privileged sidecar.
+for _v in DOCKER DOCKER_CACHE; do
+  [ -z "${!_v:-}" ] || [ "${!_v}" = 1 ] || die "$_v must be 1 (or unset), not '${!_v}'."
+done
 [ -n "${DOCKER_CACHE:-}" ] && [ -z "${DOCKER:-}" ] && die "DOCKER_CACHE=1 only works together with DOCKER=1."
 if [ -n "${DOCKER:-}" ]; then
   [ "${NET:-}" = "none" ] && die "DOCKER=1 and NET=none are mutually exclusive: the pod needs a network to reach its Docker daemon."
@@ -241,7 +245,8 @@ if [ -n "${DOCKER:-}" ]; then
   if [ -n "${DOCKER_CACHE:-}" ]; then
     # SHA-256 (cut to 16 hex chars) so distinct projects can't share a cache; sha256sum on Linux,
     # shasum on macOS.
-    _hash="$(printf '%s' "$PWD" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16)"
+    # pwd -P: the same project reached via a symlink must map to the same cache.
+    _hash="$(pwd -P | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16)"
     [[ "$_hash" =~ ^[0-9a-f]{16}$ ]] || die "Could not hash the project path (need sha256sum or shasum)."
     DIND_CACHE_VOL="copilot-pod-docker-$_hash"
     # A fixed sidecar name is the exclusive reservation: Docker refuses a second container with the
