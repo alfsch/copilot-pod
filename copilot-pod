@@ -238,6 +238,8 @@ if [ -n "${DOCKER:-}" ]; then
       die "The Docker cache for this project is in use by another session. Close it or run without DOCKER_CACHE=1."
     fi
     prune_dind_caches "$DIND_CACHE_VOL"
+    DIND_CACHE_REUSED=
+    docker volume ls -q --filter name=copilot-pod-docker- 2>/dev/null | grep -qxF -- "$DIND_CACHE_VOL" && DIND_CACHE_REUSED=1
     DIND_DATA_FLAGS=(-v "$DIND_CACHE_VOL:/home/rootless/.local/share/docker")
   fi
   docker run -d --rm --privileged \
@@ -257,6 +259,17 @@ if [ -n "${DOCKER:-}" ]; then
     [ "$_i" = 60 ] && { docker logs "$DIND_NAME" 2>&1 | tail -n 20 >&2; die "Docker sidecar did not become ready."; }
     sleep 1
   done
+  if [ -n "${DOCKER_CACHE:-}" ]; then
+    if [ -n "$DIND_CACHE_REUSED" ]; then
+      # "Images|<count>|<size>" from the sidecar's own daemon
+      _stats="$(docker exec -e DOCKER_HOST=tcp://localhost:2376 -e DOCKER_TLS_VERIFY=1 -e DOCKER_CERT_PATH=/certs/client \
+        "$DIND_NAME" docker system df --format '{{.Type}}|{{.TotalCount}}|{{.Size}}' 2>/dev/null \
+        | sed -n 's/^Images|\([0-9]*\)|\(.*\)$/\1 images, \2/p' || true)"
+      printf '%s●%s Docker cache: reusing %s%s\n' "$BOLD" "$RESET" "$DIND_CACHE_VOL" "${_stats:+ ($_stats)}" >&2
+    else
+      printf '%s●%s Docker cache: created new %s (empty, filled during this session)\n' "$BOLD" "$RESET" "$DIND_CACHE_VOL" >&2
+    fi
+  fi
   DOCKER_FLAGS+=("--network=$DIND_NET" "-v" "$DIND_CERTS:/certs:ro" \
     "-e" "DOCKER_HOST=tcp://dind:2376" "-e" "DOCKER_TLS_VERIFY=1" "-e" "DOCKER_CERT_PATH=/certs/client")
 fi
