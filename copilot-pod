@@ -181,6 +181,38 @@ DOCKER_FLAGS+=("--pids-limit=${PIDS:-4096}")
 #   - Ports published by inner containers live on the sidecar's network, not on the host.
 #   The sidecar image is pinned by digest (kept current by Renovate). Override it with DIND_IMAGE=...
 DIND_IMAGE="${DIND_IMAGE:-docker:28-dind-rootless@sha256:7c3e797187e43738220462658f4586572cbd3bf009f728b21e34d9c5c06ce431}"
+# Housekeeping for DOCKER_CACHE volumes: Docker doesn't record when a volume was last used, so each
+# DOCKER_CACHE start stamps the current project's volume in ~/.copilot-pod/docker-cache-usage, and
+# volumes untouched for DOCKER_CACHE_MAX_AGE_DAYS (default 90, 0 disables) are removed on the next
+# start. Volumes with no stamp yet (e.g. created before this existed) start their clock now, and a
+# volume still attached to a running session can't be removed, so it is kept.
+prune_dind_caches() {
+  local cur="$1" max_days="${DOCKER_CACHE_MAX_AGE_DAYS:-90}" file="$HOME/.copilot-pod/docker-cache-usage"
+  [[ "$max_days" =~ ^[0-9]+$ ]] || die "DOCKER_CACHE_MAX_AGE_DAYS must be a number of days (0 disables)."
+  [ "$max_days" -gt 0 ] || return 0
+  local now max existing tmp name ts
+  now="$(date +%s)"; max=$(( max_days * 86400 ))
+  existing="$(docker volume ls -q --filter name=copilot-pod-docker- 2>/dev/null || true)"
+  touch "$file"; tmp="$(mktemp)"
+  while read -r name ts; do
+    [ -n "$name" ] || continue
+    grep -qxF -- "$name" <<<"$existing" || continue
+    [[ "$ts" =~ ^[0-9]+$ ]] || ts="$now"
+    if [ "$name" != "$cur" ] && (( now - ts > max )); then
+      if docker volume rm "$name" >/dev/null 2>&1; then
+        printf '%s●%s Removed Docker cache %s (unused for over %s days)\n' "$BOLD" "$RESET" "$name" "$max_days" >&2
+        existing="$(grep -vxF -- "$name" <<<"$existing" || true)"
+        continue
+      fi
+    fi
+    printf '%s %s\n' "$name" "$ts" >> "$tmp"
+  done < "$file"
+  for name in $existing; do
+    grep -q "^$name " "$tmp" || printf '%s %s\n' "$name" "$now" >> "$tmp"
+  done
+  { grep -v "^$cur " "$tmp" || true; printf '%s %s\n' "$cur" "$now"; } > "$file"
+  rm -f "$tmp"
+}
 cleanup_dind() {
   docker rm -f "$DIND_NAME" >/dev/null 2>&1 || true
   docker network rm "$DIND_NET" >/dev/null 2>&1 || true
@@ -203,6 +235,7 @@ if [ -n "${DOCKER:-}" ]; then
     if [ -n "$(docker ps -q --filter "volume=$DIND_CACHE_VOL" 2>/dev/null)" ]; then
       die "The Docker cache for this project is in use by another session. Close it or run without DOCKER_CACHE=1."
     fi
+    prune_dind_caches "$DIND_CACHE_VOL"
     DIND_DATA_FLAGS=(-v "$DIND_CACHE_VOL:/home/rootless/.local/share/docker")
   fi
   docker run -d --rm --privileged \

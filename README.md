@@ -196,7 +196,8 @@ DOCKER=1 DOCKER_CACHE=1 copilot-pod
 - The data lives in a Docker named volume `copilot-pod-docker-<hash of the project path>`, one per project. It is not a host folder: overlay storage doesn't work on macOS/Windows file shares, and the directory has to be owned by the sidecar's uid 1000.
 - Only one session per project can use the cache at a time; a second one stops with a message. Run it without `DOCKER_CACHE=1` for a throwaway daemon alongside.
 - **Security trade-off:** whatever a session pulled or built, including anything malicious or secret, is still there in the next one. Skip it for untrusted code.
-- The cache grows until you clean it. Inspect with `docker volume ls --filter name=copilot-pod-docker-`, delete one with `docker volume rm <name>`; `uninstall.sh` removes them all.
+- Caches that haven't been used for 90 days are removed automatically the next time any project starts with `DOCKER_CACHE=1`. Change the limit with `DOCKER_CACHE_MAX_AGE_DAYS=30`, or disable it with `DOCKER_CACHE_MAX_AGE_DAYS=0`. Docker doesn't track volume usage itself, so last-use times are kept in `~/.copilot-pod/docker-cache-usage` (a file the pod can also see, so a misbehaving session could alter it; the worst case is a cache being removed late or early).
+- Otherwise the cache grows until you clean it. Inspect with `docker volume ls --filter name=copilot-pod-docker-`, delete one with `docker volume rm <name>`; `uninstall.sh` removes them all.
 
 ### Pasting images and screenshots
 

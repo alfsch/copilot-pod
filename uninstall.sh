@@ -53,6 +53,7 @@ if [ -n "$_vols" ]; then
   # shellcheck disable=SC2086
   docker volume rm -f $_vols >/dev/null 2>&1 || err "Some cache volumes are in use; close running sessions and retry."
   ok "Removed Docker cache volumes"
+  rm -f "$STATE_DIR/docker-cache-usage"
 else
   ok "No Docker cache volumes present"
 fi
