@@ -54,11 +54,12 @@ if [ -n "$_vols" ]; then
   # shellcheck disable=SC2086
   docker volume rm -f $_vols >/dev/null 2>&1 || die "Some cache volumes are in use; close running sessions and retry. The host directory was not removed."
   ok "Removed Docker cache volumes"
-  _usage_dir="${XDG_STATE_HOME:-$HOME/.local/state}/copilot-pod"
-  rm -rf "$_usage_dir"
 else
   ok "No Docker cache volumes present"
 fi
+# Usage stamps and locks go regardless of volumes: they can outlive volumes that were deleted by hand
+# or never created because a start failed.
+rm -rf "${XDG_STATE_HOME:-$HOME/.local/state}/copilot-pod"
 echo
 
 info "Removing host directory"
