@@ -181,26 +181,52 @@ DOCKER_FLAGS+=("--pids-limit=${PIDS:-4096}")
 #   - Ports published by inner containers live on the sidecar's network, not on the host.
 #   The sidecar image is pinned by digest (kept current by Renovate). Override it with DIND_IMAGE=...
 DIND_IMAGE="${DIND_IMAGE:-docker:28-dind-rootless@sha256:7c3e797187e43738220462658f4586572cbd3bf009f728b21e34d9c5c06ce431}"
+# Host-side state for DOCKER_CACHE (usage stamps, per-cache reservations). Deliberately outside
+# ~/.copilot-pod: that dir is mounted into the pod, so a session could edit a file there and keep (or
+# prematurely drop) its cache.
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/copilot-pod"
+HELD_LOCKS=()
+# Cross-process lock via an atomic mkdir (flock isn't available on macOS). The owner's PID is stored
+# inside, so a lock left behind by a killed launcher is detected and reclaimed. Waits up to $2 seconds.
+# Held locks are released by cleanup_dind on exit.
+lock_acquire() {
+  local dir="$1" max_wait="$2" waited=0 pid
+  mkdir -p "$(dirname "$dir")"
+  until mkdir "$dir" 2>/dev/null; do
+    pid="$(cat "$dir/pid" 2>/dev/null || true)"
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then rm -rf "$dir"; continue; fi
+    if [ "$waited" -ge "$max_wait" ]; then return 1; fi
+    sleep 1; waited=$(( waited + 1 ))
+  done
+  printf '%s' "$$" > "$dir/pid"
+  HELD_LOCKS+=("$dir")
+}
+lock_release() {
+  local dir="$1" held keep=()
+  rm -rf "$dir"
+  for held in ${HELD_LOCKS[@]+"${HELD_LOCKS[@]}"}; do [ "$held" = "$dir" ] || keep+=("$held"); done
+  HELD_LOCKS=(${keep[@]+"${keep[@]}"})
+}
 # Housekeeping for DOCKER_CACHE volumes: Docker doesn't record when a volume was last used, so each
 # DOCKER_CACHE start stamps the current project's volume in a state file, and
-# volumes untouched for DOCKER_CACHE_MAX_AGE_DAYS (default 90, 0 disables) are removed on the next
-# start. Volumes with no stamp yet (e.g. created before this existed) start their clock now, and a
-# volume still attached to a running session can't be removed, so it is kept.
+# volumes untouched for DOCKER_CACHE_MAX_AGE_DAYS (default 90, 0 disables deleting) are removed on the
+# next start. Stamping always happens, even with 0, so a later start with pruning enabled sees the real
+# last use. Volumes with no stamp yet (e.g. created before this existed) start their clock now, and a
+# volume still attached to a running session can't be removed, so it is kept. The whole
+# read/prune/write runs under a lock shared by all launches, and the file is replaced atomically.
 prune_dind_caches() {
-  local cur="$1" max_days="${DOCKER_CACHE_MAX_AGE_DAYS:-90}" file="${XDG_STATE_HOME:-$HOME/.local/state}/copilot-pod/docker-cache-usage"
+  local cur="$1" max_days="${DOCKER_CACHE_MAX_AGE_DAYS:-90}" file="$STATE_DIR/docker-cache-usage"
   [[ "$max_days" =~ ^[0-9]+$ ]] || die "DOCKER_CACHE_MAX_AGE_DAYS must be a number of days (0 disables)."
-  [ "$max_days" -gt 0 ] || return 0
-  local now max existing tmp name ts
+  local now max existing tmp out name ts
   now="$(date +%s)"; max=$(( max_days * 86400 ))
+  lock_acquire "$STATE_DIR/usage.lock" 30 || die "Could not lock $STATE_DIR/usage.lock (held by another copilot-pod start)."
   existing="$(docker volume ls -q --filter name=copilot-pod-docker- 2>/dev/null || true)"
-  # Deliberately outside ~/.copilot-pod: that dir is mounted into the pod, so a session could edit
-  # a file there and keep (or prematurely drop) its cache.
-  mkdir -p "$(dirname "$file")"; touch "$file"; tmp="$(mktemp)"
+  touch "$file"; tmp="$(mktemp "$file.XXXXXX")"; out="$(mktemp "$file.XXXXXX")"
   while read -r name ts; do
     [ -n "$name" ] || continue
     grep -qxF -- "$name" <<<"$existing" || continue
     [[ "$ts" =~ ^[0-9]+$ ]] || ts="$now"
-    if [ "$name" != "$cur" ] && (( now - ts > max )); then
+    if [ "$max_days" -gt 0 ] && [ "$name" != "$cur" ] && (( now - ts > max )); then
       if docker volume rm "$name" >/dev/null 2>&1; then
         printf '%s●%s Removed Docker cache %s (unused for over %s days)\n' "$BOLD" "$RESET" "$name" "$max_days" >&2
         existing="$(grep -vxF -- "$name" <<<"$existing" || true)"
@@ -212,13 +238,17 @@ prune_dind_caches() {
   for name in $existing; do
     grep -q "^$name " "$tmp" || printf '%s %s\n' "$name" "$now" >> "$tmp"
   done
-  { grep -v "^$cur " "$tmp" || true; printf '%s %s\n' "$cur" "$now"; } > "$file"
+  { grep -v "^$cur " "$tmp" || true; printf '%s %s\n' "$cur" "$now"; } > "$out"
+  mv -f "$out" "$file"
   rm -f "$tmp"
+  lock_release "$STATE_DIR/usage.lock"
 }
 cleanup_dind() {
+  local held
   docker rm -f "$DIND_NAME" >/dev/null 2>&1 || true
   docker network rm "$DIND_NET" >/dev/null 2>&1 || true
   docker volume rm "$DIND_CERTS" >/dev/null 2>&1 || true
+  for held in ${HELD_LOCKS[@]+"${HELD_LOCKS[@]}"}; do rm -rf "$held"; done
 }
 [ -n "${DOCKER_CACHE:-}" ] && [ -z "${DOCKER:-}" ] && die "DOCKER_CACHE=1 only works together with DOCKER=1."
 if [ -n "${DOCKER:-}" ]; then
@@ -234,6 +264,11 @@ if [ -n "${DOCKER:-}" ]; then
     # cksum is POSIX, so this hashes the same way on Linux and macOS.
     _hash="$(printf '%s' "$PWD" | cksum | cut -d' ' -f1)"
     DIND_CACHE_VOL="copilot-pod-docker-$_hash"
+    # Reserve the cache atomically (held until this launcher exits, i.e. after its sidecar is gone), so
+    # two simultaneous starts can't both pass the check and run dockerd on the same data dir. The
+    # docker ps check still catches sessions from a launcher without reservations.
+    lock_acquire "$STATE_DIR/cache-$_hash.lock" 0 \
+      || die "The Docker cache for this project is in use by another session. Close it or run without DOCKER_CACHE=1."
     if [ -n "$(docker ps -q --filter "volume=$DIND_CACHE_VOL" 2>/dev/null)" ]; then
       die "The Docker cache for this project is in use by another session. Close it or run without DOCKER_CACHE=1."
     fi
@@ -297,7 +332,9 @@ fi
 # COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN are forwarded only when set on the host (bare -e),
 # for token-based login instead of the interactive /login. They take precedence over stored
 # credentials, and they also authenticate `gh` inside the container.
+POD_NAME="copilot-pod-run-$$"
 RUN_CMD=(docker run "${DOCKER_FLAGS[@]}" \
+  ${DOCKER:+--name "$POD_NAME"} \
   --cap-drop=ALL \
   --security-opt=no-new-privileges \
   --user "$(id -u):$(id -g)" \
@@ -314,10 +351,20 @@ RUN_CMD=(docker run "${DOCKER_FLAGS[@]}" \
   copilot-pod "$@")
 
 # Without the sidecar, exec so signals and the exit code pass straight through. With it we must stay
-# alive to remove the sidecar and network on exit, so run in the foreground and keep the exit code.
+# alive to remove the sidecar and network on exit, so run the pod in the background (stdin handed over
+# explicitly, since a non-interactive shell would otherwise give it /dev/null) and wait for it. On
+# SIGTERM/SIGINT/SIGHUP the pod container is stopped first, so the cleanup afterwards isn't racing a
+# pod that still uses the network and certificate volume; the pod's own exit code is kept.
 if [ -z "${DOCKER:-}" ]; then
   exec "${RUN_CMD[@]}"
 fi
+stop_pod() { docker stop -t 10 "$POD_NAME" >/dev/null 2>&1 || docker rm -f "$POD_NAME" >/dev/null 2>&1 || true; }
+trap stop_pod TERM INT HUP
 set +e
-"${RUN_CMD[@]}"
-exit $?
+"${RUN_CMD[@]}" <&0 &
+POD_PID=$!
+while :; do
+  wait "$POD_PID"; rc=$?
+  kill -0 "$POD_PID" 2>/dev/null || break   # a trapped signal interrupts wait; keep waiting for the pod
+done
+exit "$rc"
