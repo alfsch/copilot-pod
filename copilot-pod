@@ -332,6 +332,7 @@ fi
 # credentials, and they also authenticate `gh` inside the container.
 RUN_CMD=(docker run "${DOCKER_FLAGS[@]}" \
   ${DOCKER:+--name "$POD_NAME"} \
+  ${DOCKER:+--init} \
   --cap-drop=ALL \
   --security-opt=no-new-privileges \
   --user "$(id -u):$(id -g)" \
@@ -352,7 +353,8 @@ RUN_CMD=(docker run "${DOCKER_FLAGS[@]}" \
 # non-interactive shell would otherwise give it /dev/null) and we poll for its end. On
 # SIGTERM/SIGINT/SIGHUP the pod is stopped first (or, if it doesn't exist yet, the docker client is
 # ended), so the cleanup afterwards isn't racing a pod that still uses the network. The pod's own exit
-# code is kept.
+# code is kept. The pod gets --init (tini as PID 1) so it actually reacts to that stop signal; a bare
+# shell or node as PID 1 ignores SIGTERM and would only die after the 10s grace period (exit 137).
 if [ -z "${DOCKER:-}" ]; then
   exec "${RUN_CMD[@]}"
 fi
