@@ -182,18 +182,20 @@ DOCKER_FLAGS+=("--pids-limit=${PIDS:-4096}")
 #   The sidecar image is pinned by digest (kept current by Renovate). Override it with DIND_IMAGE=...
 DIND_IMAGE="${DIND_IMAGE:-docker:28-dind-rootless@sha256:7c3e797187e43738220462658f4586572cbd3bf009f728b21e34d9c5c06ce431}"
 # Housekeeping for DOCKER_CACHE volumes: Docker doesn't record when a volume was last used, so each
-# DOCKER_CACHE start stamps the current project's volume in ~/.copilot-pod/docker-cache-usage, and
+# DOCKER_CACHE start stamps the current project's volume in a state file, and
 # volumes untouched for DOCKER_CACHE_MAX_AGE_DAYS (default 90, 0 disables) are removed on the next
 # start. Volumes with no stamp yet (e.g. created before this existed) start their clock now, and a
 # volume still attached to a running session can't be removed, so it is kept.
 prune_dind_caches() {
-  local cur="$1" max_days="${DOCKER_CACHE_MAX_AGE_DAYS:-90}" file="$HOME/.copilot-pod/docker-cache-usage"
+  local cur="$1" max_days="${DOCKER_CACHE_MAX_AGE_DAYS:-90}" file="${XDG_STATE_HOME:-$HOME/.local/state}/copilot-pod/docker-cache-usage"
   [[ "$max_days" =~ ^[0-9]+$ ]] || die "DOCKER_CACHE_MAX_AGE_DAYS must be a number of days (0 disables)."
   [ "$max_days" -gt 0 ] || return 0
   local now max existing tmp name ts
   now="$(date +%s)"; max=$(( max_days * 86400 ))
   existing="$(docker volume ls -q --filter name=copilot-pod-docker- 2>/dev/null || true)"
-  touch "$file"; tmp="$(mktemp)"
+  # Deliberately outside ~/.copilot-pod: that dir is mounted into the pod, so a session could edit
+  # a file there and keep (or prematurely drop) its cache.
+  mkdir -p "$(dirname "$file")"; touch "$file"; tmp="$(mktemp)"
   while read -r name ts; do
     [ -n "$name" ] || continue
     grep -qxF -- "$name" <<<"$existing" || continue
