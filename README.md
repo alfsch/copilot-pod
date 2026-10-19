@@ -34,6 +34,9 @@ cd ~/projects/your-project
 
 # Long path? You can alias it — see "Aliases" below.
 
+# Need Docker inside the pod? Prefix with DOCKER=1 — see "Using Docker inside the pod" below.
+# DOCKER=1 ~/tools/copilot-pod/copilot-pod
+
 # Forgot a command later? Print a copy-pastable cheatsheet of all of them
 ~/tools/copilot-pod/copilot-pod --help
 ```
@@ -138,11 +141,37 @@ PORTS="5173:5173" ~/tools/copilot-pod/copilot-pod
 
 ### Using Docker inside the pod
 
-Set `DOCKER=1` to get a throwaway Docker daemon for the session (build images, run containers, `docker compose`):
+Set `DOCKER=1` to get a throwaway Docker daemon for the session (build images, run containers, `docker compose`).
 
-```sh
-DOCKER=1 copilot-pod
-```
+**Quick start**
+
+1. Make sure the image is current. The `docker` CLI was added to the image, so re-run the installer once if you built it earlier:
+
+   ```sh
+   ~/tools/copilot-pod/install.sh
+   ```
+
+2. `cd` into your project and launch with `DOCKER=1`, either into a shell or straight into Copilot:
+
+   ```sh
+   cd ~/projects/your-project
+   DOCKER=1 ~/tools/copilot-pod/copilot-pod                 # shell
+   DOCKER=1 ~/tools/copilot-pod/copilot-pod copilot --yolo  # straight into Copilot
+   ```
+
+   You'll see `● Starting Docker sidecar...` for a few seconds on the first start while the sidecar image is pulled.
+
+3. Use Docker as usual inside the pod:
+
+   ```sh
+   docker version          # client and server should both answer
+   docker run --rm hello-world
+   docker compose up -d
+   ```
+
+Combine it with the other options if you like, e.g. `DOCKER=1 MEMORY=8g CPUS=4 PORTS=3000 copilot-pod`. With an alias (see [Aliases](#aliases)) it is just `DOCKER=1 copilot-pod`.
+
+If it doesn't start, check that your own Docker can run privileged containers (the sidecar needs `--privileged`) and that you aren't also setting `NET=none`. A sidecar that never becomes ready prints its last log lines.
 
 How it works: `copilot-pod` starts a separate **rootless Docker-in-Docker sidecar** (`docker:28-dind-rootless`) on a private per-run network and points the pod's `docker` CLI at it. Only the sidecar runs `--privileged`; the pod keeps all its hardening (no capabilities, `no-new-privileges`, default seccomp). The host's Docker socket is never mounted. The daemon is only reachable with a per-run client certificate (mutual TLS), shared with the pod through a throwaway volume. The sidecar, network and volume are removed when the session ends, taking its images and containers with it. It works on Linux, macOS and Windows (WSL2).
 
