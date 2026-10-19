@@ -195,15 +195,18 @@ prune_dind_caches() {
   [[ "$max_days" =~ ^[0-9]+$ ]] || die "DOCKER_CACHE_MAX_AGE_DAYS must be a number of days (0 disables)."
   max_days=$(( 10#$max_days ))   # values like 010 or 08 are decimal, not octal
   [ "$max_days" -gt 0 ] || return 0
-  for stamp in $(find "$STATE_DIR" -type f -mmin +$(( max_days * 1440 )) 2>/dev/null); do
+  # NUL-delimited, so paths with spaces or glob characters stay one word; and only names of the form
+  # the launcher generates are ever passed to `docker volume rm`.
+  while IFS= read -r -d '' stamp; do
     name="$(basename "$stamp")"
+    [[ "$name" =~ ^copilot-pod-docker-[0-9]+$ ]] || continue
     if out="$(docker volume rm "$name" 2>&1)"; then
       rm -f "$stamp"
       printf '%s●%s Removed Docker cache %s (unused for over %s days)\n' "$BOLD" "$RESET" "$name" "$max_days" >&2
     elif [[ "$out" == *"No such volume"* ]]; then
       rm -f "$stamp"   # already gone (deleted by hand)
     fi
-  done
+  done < <(find "$STATE_DIR" -type f -mmin +$(( max_days * 1440 )) -print0 2>/dev/null)
 }
 cleanup_dind() {
   docker rm -f "$POD_NAME" >/dev/null 2>&1 || true
