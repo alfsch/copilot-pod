@@ -11,6 +11,14 @@
       "depNameTemplate": "node",
       "datasourceTemplate": "docker",
       "versioningTemplate": "docker"
+    },
+    {
+      "description": "Keep the digest-pinned DIND sidecar image literal in the launcher current",
+      "customType": "regex",
+      "managerFilePatterns": ["/^copilot-pod$/"],
+      "matchStrings": ["(?<depName>docker):(?<currentValue>[\\w.-]+)@(?<currentDigest>sha256:[a-f0-9]{64})"],
+      "datasourceTemplate": "docker",
+      "versioningTemplate": "docker"
     }
   ],
   "packageRules": [
@@ -23,6 +31,12 @@
     {
       "description": "Pin yq's image digest (the Dockerfile COPYs the binary out of it); Renovate updates tag and digest together",
       "matchDepNames": ["mikefarah/yq"],
+      "matchDatasources": ["docker"],
+      "pinDigests": true
+    },
+    {
+      "description": "Pin the digests of the docker CLI and DIND sidecar images",
+      "matchDepNames": ["docker"],
       "matchDatasources": ["docker"],
       "pinDigests": true
     }
