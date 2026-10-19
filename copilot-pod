@@ -219,6 +219,9 @@ sidecar_failed() {
   die "$1"
 }
 cleanup_dind() {
+  # A second Ctrl-C/SIGTERM must not cut the cleanup short and leave the sidecar, network or
+  # certificate volume behind (a leftover cache sidecar would also block that project's next session).
+  trap '' INT TERM HUP
   docker rm -f "$POD_NAME" >/dev/null 2>&1 || true
   # Found by this run's label, never by name: a signal can land right after `docker run -d` created the
   # sidecar but before we noted it, and a name clash (cache in use) must not remove the other session's
