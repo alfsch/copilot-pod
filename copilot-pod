@@ -187,14 +187,32 @@ DIND_IMAGE="${DIND_IMAGE:-docker:28-dind-rootless@sha256:7c3e797187e437382204626
 STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/copilot-pod"
 HELD_LOCKS=()
 # Cross-process lock via an atomic mkdir (flock isn't available on macOS). The owner's PID is stored
-# inside, so a lock left behind by a killed launcher is detected and reclaimed. Waits up to $2 seconds.
-# Held locks are released by cleanup_dind on exit.
+# inside, so a lock left behind by a killed launcher can be reclaimed. Reclaiming is itself serialized
+# by a second mkdir lock ("<dir>.reclaim", held for milliseconds, treated as abandoned after a
+# minute), and the owner is re-read under it. Only a reclaimer can remove a lock it didn't create, so
+# it can never delete a lock that someone acquired after the dead owner's. Waits up to $2 seconds.
+# Held locks are released by cleanup_dind on exit; acquiring a lock this process already holds succeeds.
+lock_reclaim_stale() {
+  local dir="$1" pid
+  if ! mkdir "$dir.reclaim" 2>/dev/null; then
+    [ -z "$(find "$dir.reclaim" -maxdepth 0 -mmin +1 2>/dev/null)" ] || rm -rf "$dir.reclaim"
+    return 0
+  fi
+  pid="$(cat "$dir/pid" 2>/dev/null || true)"
+  if [ -n "$pid" ]; then
+    kill -0 "$pid" 2>/dev/null || rm -rf "$dir"
+  elif [ -n "$(find "$dir" -maxdepth 0 -mmin +1 2>/dev/null)" ]; then
+    rm -rf "$dir"   # owner died between mkdir and writing its PID
+  fi
+  rmdir "$dir.reclaim"
+}
 lock_acquire() {
-  local dir="$1" max_wait="$2" waited=0 pid
+  local dir="$1" max_wait="$2" waited=0
   mkdir -p "$(dirname "$dir")"
-  until mkdir "$dir" 2>/dev/null; do
-    pid="$(cat "$dir/pid" 2>/dev/null || true)"
-    if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then rm -rf "$dir"; continue; fi
+  while ! mkdir "$dir" 2>/dev/null; do
+    [ "$(cat "$dir/pid" 2>/dev/null || true)" != "$$" ] || return 0
+    lock_reclaim_stale "$dir"
+    mkdir "$dir" 2>/dev/null && break
     if [ "$waited" -ge "$max_wait" ]; then return 1; fi
     sleep 1; waited=$(( waited + 1 ))
   done
@@ -207,6 +225,9 @@ lock_release() {
   for held in ${HELD_LOCKS[@]+"${HELD_LOCKS[@]}"}; do [ "$held" = "$dir" ] || keep+=("$held"); done
   HELD_LOCKS=(${keep[@]+"${keep[@]}"})
 }
+# Only volumes this launcher generates: --filter name= matches substrings, which would also catch
+# unrelated volumes like "backup-copilot-pod-docker-123".
+list_dind_caches() { docker volume ls -q --filter name=copilot-pod-docker- 2>/dev/null | grep -E '^copilot-pod-docker-[0-9]+$' || true; }
 # Housekeeping for DOCKER_CACHE volumes: Docker doesn't record when a volume was last used, so each
 # DOCKER_CACHE start stamps the current project's volume in a state file, and
 # volumes untouched for DOCKER_CACHE_MAX_AGE_DAYS (default 90, 0 disables deleting) are removed on the
@@ -220,7 +241,7 @@ prune_dind_caches() {
   local now max existing tmp out name ts
   now="$(date +%s)"; max=$(( max_days * 86400 ))
   lock_acquire "$STATE_DIR/usage.lock" 30 || die "Could not lock $STATE_DIR/usage.lock (held by another copilot-pod start)."
-  existing="$(docker volume ls -q --filter name=copilot-pod-docker- 2>/dev/null || true)"
+  existing="$(list_dind_caches)"
   touch "$file"; tmp="$(mktemp "$file.XXXXXX")"; out="$(mktemp "$file.XXXXXX")"
   while read -r name ts; do
     [ -n "$name" ] || continue
@@ -243,9 +264,20 @@ prune_dind_caches() {
   rm -f "$tmp"
   lock_release "$STATE_DIR/usage.lock"
 }
+# Stamp a cache's last use (also done at shutdown: a session may outlive the age limit).
+stamp_dind_cache() {
+  local cur="$1" file="$STATE_DIR/docker-cache-usage" tmp
+  mkdir -p "$STATE_DIR"; touch "$file"; tmp="$(mktemp "$file.XXXXXX")"
+  { grep -v "^$cur " "$file" || true; printf '%s %s\n' "$cur" "$(date +%s)"; } > "$tmp"
+  mv -f "$tmp" "$file"
+}
 cleanup_dind() {
   local held
+  # With a cache, take the usage lock before removing the sidecar and keep it until the stamp is
+  # written, so no other launcher can prune this cache in between. If the lock can't be had, still clean up.
+  [ -z "${DIND_CACHE_VOL:-}" ] || lock_acquire "$STATE_DIR/usage.lock" 30 || true
   docker rm -f "$DIND_NAME" >/dev/null 2>&1 || true
+  [ -z "${DIND_CACHE_VOL:-}" ] || stamp_dind_cache "$DIND_CACHE_VOL" 2>/dev/null || true
   docker network rm "$DIND_NET" >/dev/null 2>&1 || true
   docker volume rm "$DIND_CERTS" >/dev/null 2>&1 || true
   for held in ${HELD_LOCKS[@]+"${HELD_LOCKS[@]}"}; do rm -rf "$held"; done
@@ -274,7 +306,7 @@ if [ -n "${DOCKER:-}" ]; then
     fi
     prune_dind_caches "$DIND_CACHE_VOL"
     DIND_CACHE_REUSED=
-    docker volume ls -q --filter name=copilot-pod-docker- 2>/dev/null | grep -qxF -- "$DIND_CACHE_VOL" && DIND_CACHE_REUSED=1
+    list_dind_caches | grep -qxF -- "$DIND_CACHE_VOL" && DIND_CACHE_REUSED=1
     DIND_DATA_FLAGS=(-v "$DIND_CACHE_VOL:/home/rootless/.local/share/docker")
   fi
   docker run -d --rm --privileged \
@@ -358,13 +390,20 @@ RUN_CMD=(docker run "${DOCKER_FLAGS[@]}" \
 if [ -z "${DOCKER:-}" ]; then
   exec "${RUN_CMD[@]}"
 fi
-stop_pod() { docker stop -t 10 "$POD_NAME" >/dev/null 2>&1 || docker rm -f "$POD_NAME" >/dev/null 2>&1 || true; }
+stop_pod() { SIG_SEEN=1; docker stop -t 10 "$POD_NAME" >/dev/null 2>&1 || docker rm -f "$POD_NAME" >/dev/null 2>&1 || true; }
 trap stop_pod TERM INT HUP
 set +e
 "${RUN_CMD[@]}" <&0 &
 POD_PID=$!
+# A trapped signal interrupts `wait` with 128+N without reaping the pod, so keep waiting. If the pod
+# exited meanwhile, a second wait collects its real status (127 means the first one already had it).
 while :; do
+  SIG_SEEN=
   wait "$POD_PID"; rc=$?
-  kill -0 "$POD_PID" 2>/dev/null || break   # a trapped signal interrupts wait; keep waiting for the pod
+  [ -n "$SIG_SEEN" ] && [ "$rc" -gt 128 ] || break
+  kill -0 "$POD_PID" 2>/dev/null && continue
+  wait "$POD_PID"; _rc2=$?
+  [ "$_rc2" -eq 127 ] || rc="$_rc2"
+  break
 done
 exit "$rc"
