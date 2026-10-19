@@ -24,6 +24,7 @@ if [ "${1:-}" = "--help" ] || [ "${1:-}" = "-h" ]; then
   printf '\n%sOptions%s  (prefix any run command):\n' "$BOLD" "$RESET"
   row "Publish ports:"  "PORTS=\"3000 5173\" $HERE/copilot-pod"
   row "Isolate/limit:"  "NET=none MEMORY=4g PIDS=512 $HERE/copilot-pod"
+  row "Docker access:"  "DOCKER=1 $HERE/copilot-pod"
   printf '\n'
   row "Shortcut alias:" "alias copilot-pod=$HERE/copilot-pod"
   row "Full README:"    "https://github.com/alfsch/copilot-pod"
@@ -157,6 +158,47 @@ DOCKER_FLAGS+=("--pids-limit=${PIDS:-4096}")
 [ -n "${MEMORY:-}" ] && DOCKER_FLAGS+=("--memory=$MEMORY")
 [ -n "${CPUS:-}" ]   && DOCKER_FLAGS+=("--cpus=$CPUS")
 
+# Optional Docker access (DOCKER=1):
+#   Gives the session its own throwaway Docker daemon without weakening this container. A separate
+#   rootless Docker-in-Docker sidecar runs on a private per-run network; only it gets --privileged
+#   (rootless dockerd needs user namespaces, which the hardening above forbids). This container keeps
+#   every restriction and only gets the docker CLI pointing at the sidecar via DOCKER_HOST. It never
+#   touches the host's Docker socket, and works the same on Linux, macOS and Windows (WSL2).
+#   - The daemon is plain TCP without TLS: the port is never published and the network contains only
+#     this pod and the sidecar, so nothing else can reach it.
+#   - $PWD is mounted into the sidecar at the same path so `docker run -v "$PWD:..."` resolves. The
+#     sidecar user is uid 1000, so on hosts where your uid differs, inner containers may not be able
+#     to write to the project.
+#   - Images, containers and volumes of the inner daemon vanish when the session ends.
+#   - Ports published by inner containers live on the sidecar's network, not on the host.
+#   Override the sidecar image with DIND_IMAGE=...
+DIND_IMAGE="${DIND_IMAGE:-docker:28-dind-rootless}"
+cleanup_dind() {
+  docker rm -f "$DIND_NAME" >/dev/null 2>&1 || true
+  docker network rm "$DIND_NET" >/dev/null 2>&1 || true
+}
+if [ -n "${DOCKER:-}" ]; then
+  [ "${NET:-}" = "none" ] && die "DOCKER=1 and NET=none are mutually exclusive: the pod needs a network to reach its Docker daemon."
+  DIND_NAME="copilot-pod-dind-$$"
+  DIND_NET="copilot-pod-net-$$"
+  trap cleanup_dind EXIT
+  docker network create "$DIND_NET" >/dev/null || die "Could not create network for the Docker sidecar."
+  docker run -d --rm --privileged \
+    --name "$DIND_NAME" --network "$DIND_NET" --network-alias dind \
+    --pids-limit="${PIDS:-4096}" \
+    ${MEMORY:+--memory="$MEMORY"} ${CPUS:+--cpus="$CPUS"} \
+    -e DOCKER_TLS_CERTDIR= \
+    -v "$PWD:$PWD" \
+    "$DIND_IMAGE" >/dev/null || die "Could not start the Docker sidecar ($DIND_IMAGE)."
+  printf '%s●%s Starting Docker sidecar...\n' "$BOLD" "$RESET" >&2
+  for _i in $(seq 1 60); do
+    docker exec "$DIND_NAME" docker -H tcp://127.0.0.1:2375 info >/dev/null 2>&1 && break
+    [ "$_i" = 60 ] && { docker logs "$DIND_NAME" 2>&1 | tail -n 20 >&2; die "Docker sidecar did not become ready."; }
+    sleep 1
+  done
+  DOCKER_FLAGS+=("--network=$DIND_NET" "-e" "DOCKER_HOST=tcp://dind:2375")
+fi
+
 # Hardening:
 #   --cap-drop=ALL                       Drop all Linux capabilities. An interactive dev shell
 #                                        as an unprivileged user needs none; this closes off
@@ -180,7 +222,7 @@ DOCKER_FLAGS+=("--pids-limit=${PIDS:-4096}")
 # COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN are forwarded only when set on the host (bare -e),
 # for token-based login instead of the interactive /login. They take precedence over stored
 # credentials, and they also authenticate `gh` inside the container.
-exec docker run "${DOCKER_FLAGS[@]}" \
+RUN_CMD=(docker run "${DOCKER_FLAGS[@]}" \
   --cap-drop=ALL \
   --security-opt=no-new-privileges \
   --user "$(id -u):$(id -g)" \
@@ -194,4 +236,13 @@ exec docker run "${DOCKER_FLAGS[@]}" \
   -w "$PWD" \
   -v "$HOME/.copilot-pod:/home/copilot-pod/.copilot" \
   -v "$HOME/.copilot-pod/.copilot.json:/home/copilot-pod/.copilot.json" \
-  copilot-pod "$@"
+  copilot-pod "$@")
+
+# Without the sidecar, exec so signals and the exit code pass straight through. With it we must stay
+# alive to remove the sidecar and network on exit, so run in the foreground and keep the exit code.
+if [ -z "${DOCKER:-}" ]; then
+  exec "${RUN_CMD[@]}"
+fi
+set +e
+"${RUN_CMD[@]}"
+exit $?

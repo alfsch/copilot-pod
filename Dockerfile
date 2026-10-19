@@ -16,6 +16,11 @@ RUN apt-get update \
 # image contents.
 COPY --from=mikefarah/yq:4.54.1@sha256:4b3d9475d65571d28cbb19544d3820ec2945e4c8b2f18279394282b8dc3a592e /usr/bin/yq /usr/local/bin/yq
 
+# Docker CLI (and the compose plugin) only, no daemon. It is inert unless the launcher is run with
+# DOCKER=1, which points it at a rootless Docker-in-Docker sidecar via DOCKER_HOST.
+COPY --from=docker:28-cli /usr/local/bin/docker /usr/local/bin/docker
+COPY --from=docker:28-cli /usr/local/libexec/docker/cli-plugins/docker-compose /usr/local/libexec/docker/cli-plugins/docker-compose
+
 # Override at build time with --build-arg COPILOT_CLI_VERSION=2.x.y to pin a specific
 # version. Default "latest" is the npm dist-tag for the official release (@github/copilot has no
 # "stable" tag).

@@ -48,6 +48,7 @@ Docker is the only requirement — no Node.js, npm, or `copilot` needed on your 
   - [Aliases](#aliases)
   - [First launch (login)](#first-launch-login)
   - [Exposing ports](#exposing-ports)
+  - [Using Docker inside the pod](#using-docker-inside-the-pod)
   - [Pasting images and screenshots](#pasting-images-and-screenshots)
   - [Updating or pinning the Copilot CLI version](#updating-or-pinning-the-copilot-cli-version)
   - [Customizing the image](#customizing-the-image)
@@ -135,6 +136,24 @@ PORTS="5173:5173" ~/tools/copilot-pod/copilot-pod
 >
 > The host-side mapping is still `127.0.0.1`-only (forced by `copilot-pod`), so binding `0.0.0.0` inside the container does not expose your dev server to your LAN.
 
+### Using Docker inside the pod
+
+Set `DOCKER=1` to get a throwaway Docker daemon for the session (build images, run containers, `docker compose`):
+
+```sh
+DOCKER=1 copilot-pod
+```
+
+How it works: `copilot-pod` starts a separate **rootless Docker-in-Docker sidecar** (`docker:28-dind-rootless`) on a private per-run network and points the pod's `docker` CLI at it. Only the sidecar runs `--privileged`; the pod keeps all its hardening (no capabilities, `no-new-privileges`, default seccomp). The host's Docker socket is never mounted. The sidecar and its network are removed when the session ends, taking its images and containers with it. It works on Linux, macOS and Windows (WSL2).
+
+Things to know:
+
+- The sidecar is privileged (inside Docker's VM on macOS/Windows). A kernel or runtime escape from it would be more serious than from the default pod, so use `DOCKER=1` only on projects you trust.
+- The project folder is mounted into the sidecar at the same path, so `docker run -v "$PWD:/app" ...` works. The sidecar runs as uid 1000; if your host uid differs, inner containers may not be able to write to the project.
+- Ports published by inner containers are not reachable from the host.
+- `DOCKER=1` and `NET=none` are mutually exclusive. `MEMORY`, `CPUS` and `PIDS` apply to the sidecar too. Set `DIND_IMAGE=...` to use a different sidecar image.
+- Images are re-pulled every session.
+
 ### Pasting images and screenshots
 
 Copilot can only read files that live **inside the project folder** — that's the one directory bind-mounted into the container. Images on your Desktop or in Downloads aren't mounted, so pasting one straight from there hands Copilot a path it can't reach. This is the same isolation that keeps the rest of your machine private from the container ([What is and isn't isolated](#what-is-and-isnt-isolated)); the small bit of friction below is the price for not exposing those default locations.
@@ -172,7 +191,7 @@ Pinned versions cache normally across rebuilds. The script prints the resolved v
 
 ### Customizing the image
 
-The image is intentionally minimal: `node:24-slim` + `git` + `curl` + `less` + `jq` + `gh` + `yq` + `python3` + `pip` + `venv` + `pdftotext` (poppler-utils) + `qpdf` + `tesseract` (English, German) + Copilot CLI. Nothing project-specific. Anything else your projects need (build tools, other toolchains, more OCR languages) you add yourself — edit the `Dockerfile` and re-run `~/tools/copilot-pod/install.sh`.
+The image is intentionally minimal: `node:24-slim` + `git` + `curl` + `less` + `jq` + `gh` + `yq` + the `docker` CLI (+ compose plugin) + `python3` + `pip` + `venv` + `pdftotext` (poppler-utils) + `qpdf` + `tesseract` (English, German) + Copilot CLI. Nothing project-specific. Anything else your projects need (build tools, other toolchains, more OCR languages) you add yourself — edit the `Dockerfile` and re-run `~/tools/copilot-pod/install.sh`.
 
 ## Security and limits
 
