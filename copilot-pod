@@ -308,6 +308,9 @@ if [ -n "${DOCKER:-}" ]; then
   DIND_NET="copilot-pod-net-$$"
   DIND_CERTS="copilot-pod-certs-$$"
   trap cleanup_dind EXIT
+  # Signals during startup: bash runs these only after the command in flight has finished, so cleanup
+  # never races a still-running `docker run -d`. They are replaced by stop_pod once the pod starts.
+  trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP
   docker network create "$DIND_NET" >/dev/null || die "Could not create network for the Docker sidecar."
   docker volume create "$DIND_CERTS" >/dev/null || die "Could not create certificate volume for the Docker sidecar."
   DIND_DATA_FLAGS=()
@@ -435,5 +438,7 @@ while kill -0 "$POD_PID" 2>/dev/null; do
   fi
 done
 wait "$POD_PID"; rc=$?
-[ -z "$SIG_SEEN" ] || docker rm -f "$POD_NAME" >/dev/null 2>&1 || true
+# Always remove the pod: if the client died or lost its connection without a signal reaching us, the
+# container may still be running and would block removal of the network and certificate volume.
+docker rm -f "$POD_NAME" >/dev/null 2>&1 || true
 exit "$rc"
