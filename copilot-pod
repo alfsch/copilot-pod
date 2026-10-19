@@ -208,6 +208,16 @@ prune_dind_caches() {
     fi
   done < <(find "$STATE_DIR" -type f -mmin +$(( max_days * 1440 )) -print0 2>/dev/null)
 }
+# Show the sidecar's last log lines and, for the known host-side cause, how to fix it.
+sidecar_failed() {
+  local logs
+  logs="$(docker logs "$DIND_NAME" 2>&1 | tail -n 20)"
+  printf '%s\n' "$logs" >&2
+  if grep -qi 'rootlesskit.*operation not permitted' <<<"$logs"; then
+    err "Rootless Docker needs unprivileged user namespaces. On Ubuntu 24.04+ AppArmor restricts them (kernel.apparmor_restrict_unprivileged_userns=1); see 'Requirements for DOCKER=1' in the README."
+  fi
+  die "$1"
+}
 cleanup_dind() {
   docker rm -f "$POD_NAME" >/dev/null 2>&1 || true
   # Found by this run's label, never by name: a signal can land right after `docker run -d` created the
@@ -275,7 +285,11 @@ if [ -n "${DOCKER:-}" ]; then
   for _i in $(seq 1 60); do
     docker exec -e DOCKER_HOST=tcp://localhost:2376 -e DOCKER_TLS_VERIFY=1 -e DOCKER_CERT_PATH=/certs/client \
       "$DIND_NAME" docker info >/dev/null 2>&1 && break
-    [ "$_i" = 60 ] && { docker logs "$DIND_NAME" 2>&1 | tail -n 20 >&2; die "Docker sidecar did not become ready."; }
+    # An exited sidecar will never become ready: report right away instead of after the full 60s.
+    if [ "$(docker inspect -f '{{.State.Running}}' "$DIND_NAME" 2>/dev/null)" != true ]; then
+      sidecar_failed "Docker sidecar exited during startup."
+    fi
+    [ "$_i" = 60 ] && sidecar_failed "Docker sidecar did not become ready."
     sleep 1
   done
   if [ -n "${DOCKER_CACHE:-}" ]; then

@@ -176,6 +176,19 @@ If it doesn't start, check that your own Docker can run privileged containers (t
 
 How it works: `copilot-pod` starts a separate **rootless Docker-in-Docker sidecar** (`docker:28-dind-rootless`) on a private per-run network and points the pod's `docker` CLI at it. Only the sidecar runs `--privileged`; the pod keeps all its hardening (no capabilities, `no-new-privileges`, default seccomp). The host's Docker socket is never mounted. The daemon is only reachable with a per-run client certificate (mutual TLS), shared with the pod through a throwaway volume. The sidecar, network and volume are removed when the session ends, taking its images and containers with it. It works on Linux, macOS and Windows (WSL2).
 
+**Requirements for `DOCKER=1`**
+
+- A Docker host where privileged containers are allowed (Docker Desktop on macOS/Windows works out of the box).
+- On Linux the rootless daemon in the sidecar needs unprivileged user namespaces. Ubuntu 24.04 and newer restrict them through AppArmor, and the sidecar then fails with `rootlesskit ... fork/exec /proc/self/exe: operation not permitted` (the launcher points here). Check with `sysctl kernel.apparmor_restrict_unprivileged_userns`; if it is `1`, allow them permanently:
+
+  ```sh
+  echo 'kernel.apparmor_restrict_unprivileged_userns = 0' | sudo tee /etc/sysctl.d/99-copilot-pod-userns.conf
+  sudo sysctl --system
+  ```
+
+  or only until the next reboot: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`. This loosens the restriction for every program on the machine, not just copilot-pod. To undo it, delete the file and run `sudo sysctl --system` (or reboot).
+- The rootless daemon runs without cgroups, so `docker run --memory/--cpus` inside the pod has no effect. `MEMORY`, `CPUS` and `PIDS` still limit the sidecar as a whole.
+
 Things to know:
 
 - The sidecar is privileged (inside Docker's VM on macOS/Windows). A kernel or runtime escape from it would be more serious than from the default pod, so use `DOCKER=1` only on projects you trust.
