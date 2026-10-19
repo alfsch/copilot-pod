@@ -181,7 +181,7 @@ Things to know:
 - The sidecar is privileged (inside Docker's VM on macOS/Windows). A kernel or runtime escape from it would be more serious than from the default pod, so use `DOCKER=1` only on projects you trust.
 - The project folder is mounted into the sidecar at the same path, so `docker run -v "$PWD:/app" ...` works. The sidecar runs as uid 1000; if your host uid differs, inner containers may not be able to write to the project.
 - Both Docker images (the CLI in the pod, the sidecar) are pinned by digest; `DIND_IMAGE` overrides the sidecar.
-- Ports published by inner containers are not reachable from the host.
+- Ports published by inner containers (`docker run -p ...`) live on the sidecar's network, not on your host's `localhost`; to reach them from the host, use `PORTS=...` on the pod's own ports instead. This is not a security boundary: on native Linux the sidecar's bridge network is routable from the host, so a port an inner container publishes on all interfaces can still be reached from the host via the sidecar's bridge IP. Bind such ports to `127.0.0.1` inside the sidecar (`-p 127.0.0.1:8080:80`) if that matters.
 - `DOCKER=1` and `NET=none` are mutually exclusive. `MEMORY`, `CPUS` and `PIDS` apply to the sidecar too. Set `DIND_IMAGE=...` to use a different sidecar image (pin it by digest).
 - Images are re-pulled every session by default. See [Keeping images between sessions](#keeping-images-between-sessions) to reuse them.
 
