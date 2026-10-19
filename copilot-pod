@@ -190,19 +190,22 @@ HELD_LOCKS=()
 # inside so a lock left behind by a killed launcher can be reclaimed. Acquiring, releasing and
 # reclaiming all run inside one short critical section guarded by a second mkdir lock ("<dir>.g"), so
 # the owner is read, judged dead and the lock replaced without anyone acquiring or releasing in
-# between. The guard is held for milliseconds; it is only broken after a minute, i.e. if its holder was
-# killed inside that window. Acquiring a lock this process already holds succeeds. Held locks are
-# released by cleanup_dind on exit.
+# between. The guard is held for milliseconds and is never broken automatically (there is no safe
+# compare-and-delete in shell): it is removed by the cleanup trap if the launcher is terminated inside
+# it, and if one was SIGKILLed there, waiters fail closed after 60s and name the directory to delete.
+# Acquiring a lock this process already holds succeeds. Held locks are released by cleanup_dind on exit.
+GUARD_HELD=
 guard_enter() {
   local g="$1.g" n=0
   mkdir -p "$(dirname "$1")"
   until mkdir "$g" 2>/dev/null; do
-    [ -z "$(find "$g" -maxdepth 0 -mmin +1 2>/dev/null)" ] || rm -rf "$g"
-    n=$(( n + 1 )); [ "$n" -lt 1200 ] || return 1
+    n=$(( n + 1 ))
+    if [ "$n" -ge 1200 ]; then err "Lock guard $g is stuck (a copilot-pod launcher was killed inside it). Remove that directory and retry."; return 1; fi
     sleep 0.05
   done
+  GUARD_HELD="$g"
 }
-guard_leave() { rmdir "$1.g" 2>/dev/null || true; }
+guard_leave() { rmdir "$1.g" 2>/dev/null || true; GUARD_HELD=; }
 lock_try() {   # call inside the guard
   local dir="$1" pid
   if ! mkdir "$dir" 2>/dev/null; then
@@ -286,6 +289,8 @@ stamp_dind_cache() {
 }
 cleanup_dind() {
   local held locked=
+  [ -z "$GUARD_HELD" ] || { rmdir "$GUARD_HELD" 2>/dev/null || true; GUARD_HELD=; }   # terminated inside a critical section
+  [ -z "${POD_RC_FILE:-}" ] || rm -f "$POD_RC_FILE"
   # With a cache, take the usage lock before removing the sidecar and keep it until the stamp is
   # written, so no other launcher can prune this cache in between. Without the lock, still clean up
   # but leave the usage file alone.
@@ -408,27 +413,29 @@ if [ -z "${DOCKER:-}" ]; then
   exec "${RUN_CMD[@]}"
 fi
 stop_pod() { SIG_SEEN=1; docker stop -t 10 "$POD_NAME" >/dev/null 2>&1 || docker rm -f "$POD_NAME" >/dev/null 2>&1 || true; }
+SIG_SEEN=
 trap stop_pod TERM INT HUP
 set +e
-"${RUN_CMD[@]}" <&0 &
+# The pod's exit status goes through a file, because `wait` can't tell an interrupted wait (128+N)
+# from a pod that really exited with that status. The subshell survives the same terminal signals the
+# docker client gets, so it always gets to record the status.
+POD_RC_FILE="$(mktemp)"
+( trap : INT TERM HUP; "${RUN_CMD[@]}"; echo $? > "$POD_RC_FILE" ) <&0 &
 POD_PID=$!
-# A trapped signal interrupts `wait` with 128+N without reaping the pod. If it arrives while
-# `docker run` is still creating the container, there is nothing to stop yet, so keep retrying the stop
-# until the client is gone (and end the client itself after ~30s). Afterwards a second wait collects
-# the real exit status (127 means the first wait already had it).
-while :; do
-  SIG_SEEN=
-  wait "$POD_PID"; rc=$?
-  [ -n "$SIG_SEEN" ] && [ "$rc" -gt 128 ] || break
-  _tries=0
-  while kill -0 "$POD_PID" 2>/dev/null; do
+# A trapped signal interrupts `wait`. If it arrives while `docker run` is still creating the container
+# there is nothing to stop yet, so keep retrying the stop until the client is gone (and end the
+# subshell itself after ~30s).
+_tries=0
+while kill -0 "$POD_PID" 2>/dev/null; do
+  if [ -n "$SIG_SEEN" ]; then
     stop_pod
     _tries=$(( _tries + 1 ))
     [ "$_tries" -lt 30 ] || kill -TERM "$POD_PID" 2>/dev/null || true
     sleep 1
-  done
-  wait "$POD_PID"; _rc2=$?
-  [ "$_rc2" -eq 127 ] || rc="$_rc2"
-  break
+  else
+    wait "$POD_PID" 2>/dev/null
+  fi
 done
-exit "$rc"
+wait "$POD_PID" 2>/dev/null
+rc="$(cat "$POD_RC_FILE" 2>/dev/null || true)"
+exit "${rc:-143}"
