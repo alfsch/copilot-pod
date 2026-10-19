@@ -164,39 +164,47 @@ DOCKER_FLAGS+=("--pids-limit=${PIDS:-4096}")
 #   (rootless dockerd needs user namespaces, which the hardening above forbids). This container keeps
 #   every restriction and only gets the docker CLI pointing at the sidecar via DOCKER_HOST. It never
 #   touches the host's Docker socket, and works the same on Linux, macOS and Windows (WSL2).
-#   - The daemon is plain TCP without TLS: the port is never published and the network contains only
-#     this pod and the sidecar, so nothing else can reach it.
+#   - The daemon requires mutual TLS (port 2376). The sidecar generates the certificates into a
+#     per-run volume that only it and this pod mount, so other containers and local host users that
+#     can reach the sidecar's bridge IP can't use the daemon. The port is never published.
 #   - $PWD is mounted into the sidecar at the same path so `docker run -v "$PWD:..."` resolves. The
 #     sidecar user is uid 1000, so on hosts where your uid differs, inner containers may not be able
 #     to write to the project.
 #   - Images, containers and volumes of the inner daemon vanish when the session ends.
 #   - Ports published by inner containers live on the sidecar's network, not on the host.
-#   Override the sidecar image with DIND_IMAGE=...
-DIND_IMAGE="${DIND_IMAGE:-docker:28-dind-rootless}"
+#   The sidecar image is pinned by digest (kept current by Renovate). Override it with DIND_IMAGE=...
+DIND_IMAGE="${DIND_IMAGE:-docker:28-dind-rootless@sha256:7c3e797187e43738220462658f4586572cbd3bf009f728b21e34d9c5c06ce431}"
 cleanup_dind() {
   docker rm -f "$DIND_NAME" >/dev/null 2>&1 || true
   docker network rm "$DIND_NET" >/dev/null 2>&1 || true
+  docker volume rm "$DIND_CERTS" >/dev/null 2>&1 || true
 }
 if [ -n "${DOCKER:-}" ]; then
   [ "${NET:-}" = "none" ] && die "DOCKER=1 and NET=none are mutually exclusive: the pod needs a network to reach its Docker daemon."
   DIND_NAME="copilot-pod-dind-$$"
   DIND_NET="copilot-pod-net-$$"
+  DIND_CERTS="copilot-pod-certs-$$"
   trap cleanup_dind EXIT
   docker network create "$DIND_NET" >/dev/null || die "Could not create network for the Docker sidecar."
+  docker volume create "$DIND_CERTS" >/dev/null || die "Could not create certificate volume for the Docker sidecar."
   docker run -d --rm --privileged \
     --name "$DIND_NAME" --network "$DIND_NET" --network-alias dind \
     --pids-limit="${PIDS:-4096}" \
     ${MEMORY:+--memory="$MEMORY"} ${CPUS:+--cpus="$CPUS"} \
-    -e DOCKER_TLS_CERTDIR= \
+    -e DOCKER_TLS_CERTDIR=/certs \
+    -e DOCKER_TLS_SAN=DNS:dind \
+    -v "$DIND_CERTS:/certs" \
     -v "$PWD:$PWD" \
     "$DIND_IMAGE" >/dev/null || die "Could not start the Docker sidecar ($DIND_IMAGE)."
   printf '%s●%s Starting Docker sidecar...\n' "$BOLD" "$RESET" >&2
   for _i in $(seq 1 60); do
-    docker exec "$DIND_NAME" docker -H tcp://127.0.0.1:2375 info >/dev/null 2>&1 && break
+    docker exec -e DOCKER_HOST=tcp://localhost:2376 -e DOCKER_TLS_VERIFY=1 -e DOCKER_CERT_PATH=/certs/client \
+      "$DIND_NAME" docker info >/dev/null 2>&1 && break
     [ "$_i" = 60 ] && { docker logs "$DIND_NAME" 2>&1 | tail -n 20 >&2; die "Docker sidecar did not become ready."; }
     sleep 1
   done
-  DOCKER_FLAGS+=("--network=$DIND_NET" "-e" "DOCKER_HOST=tcp://dind:2375")
+  DOCKER_FLAGS+=("--network=$DIND_NET" "-v" "$DIND_CERTS:/certs:ro" \
+    "-e" "DOCKER_HOST=tcp://dind:2376" "-e" "DOCKER_TLS_VERIFY=1" "-e" "DOCKER_CERT_PATH=/certs/client")
 fi
 
 # Hardening:
