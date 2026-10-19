@@ -186,7 +186,12 @@ How it works: `copilot-pod` starts a separate **rootless Docker-in-Docker sideca
   sudo sysctl --system
   ```
 
-  or only until the next reboot: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`. This loosens the restriction for every program on the machine, not just copilot-pod. To undo it, delete the file and run `sudo sysctl --system` (or reboot).
+  or only until the next reboot: `sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0`. This loosens the restriction for every program on the machine, not just copilot-pod. To undo it, delete the file and set the value back explicitly, because `sysctl --system` only applies configured values and does not restore the kernel default (a reboot works too):
+
+  ```sh
+  sudo rm /etc/sysctl.d/99-copilot-pod-userns.conf
+  sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=1
+  ```
 - The rootless daemon runs without cgroups, so `docker run --memory/--cpus` inside the pod has no effect. `MEMORY`, `CPUS` and `PIDS` still limit the sidecar as a whole.
 
 Things to know:
