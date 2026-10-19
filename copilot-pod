@@ -234,7 +234,7 @@ lock_acquire() {
 }
 lock_release() {
   local dir="$1" held keep=()
-  guard_enter "$dir" || true
+  guard_enter "$dir" || return 1   # without the guard, touch nothing; a dead owner's lock is reclaimed later
   [ "$(cat "$dir/pid" 2>/dev/null || true)" != "$$" ] || rm -rf "$dir"
   guard_leave "$dir"
   for held in ${HELD_LOCKS[@]+"${HELD_LOCKS[@]}"}; do [ "$held" = "$dir" ] || keep+=("$held"); done
@@ -290,7 +290,6 @@ stamp_dind_cache() {
 cleanup_dind() {
   local held locked=
   [ -z "$GUARD_HELD" ] || { rmdir "$GUARD_HELD" 2>/dev/null || true; GUARD_HELD=; }   # terminated inside a critical section
-  [ -z "${POD_RC_FILE:-}" ] || rm -f "$POD_RC_FILE"
   # With a cache, take the usage lock before removing the sidecar and keep it until the stamp is
   # written, so no other launcher can prune this cache in between. Without the lock, still clean up
   # but leave the usage file alone.
@@ -416,26 +415,25 @@ stop_pod() { SIG_SEEN=1; docker stop -t 10 "$POD_NAME" >/dev/null 2>&1 || docker
 SIG_SEEN=
 trap stop_pod TERM INT HUP
 set +e
-# The pod's exit status goes through a file, because `wait` can't tell an interrupted wait (128+N)
-# from a pod that really exited with that status. The subshell survives the same terminal signals the
-# docker client gets, so it always gets to record the status.
-POD_RC_FILE="$(mktemp)"
-( trap : INT TERM HUP; "${RUN_CMD[@]}"; echo $? > "$POD_RC_FILE" ) <&0 &
+"${RUN_CMD[@]}" <&0 &
 POD_PID=$!
-# A trapped signal interrupts `wait`. If it arrives while `docker run` is still creating the container
-# there is nothing to stop yet, so keep retrying the stop until the client is gone (and end the
-# subshell itself after ~30s).
+# Poll instead of blocking in `wait`: a trapped signal is handled within a fraction of a second, and
+# the pod's status stays unreaped until the final wait, so it can't be confused with an interrupted
+# wait (128+N). If a signal arrives while `docker run` is still creating the container there is nothing
+# to stop yet, so the stop is retried. The client itself gets SIGTERM after ~30s and SIGKILL after
+# ~40s, and once it is gone any pod it managed to create is removed, so nothing starts after cleanup.
 _tries=0
 while kill -0 "$POD_PID" 2>/dev/null; do
   if [ -n "$SIG_SEEN" ]; then
     stop_pod
     _tries=$(( _tries + 1 ))
-    [ "$_tries" -lt 30 ] || kill -TERM "$POD_PID" 2>/dev/null || true
+    if [ "$_tries" -ge 40 ]; then kill -KILL "$POD_PID" 2>/dev/null || true
+    elif [ "$_tries" -ge 30 ]; then kill -TERM "$POD_PID" 2>/dev/null || true; fi
     sleep 1
   else
-    wait "$POD_PID" 2>/dev/null
+    sleep 0.2
   fi
 done
-wait "$POD_PID" 2>/dev/null
-rc="$(cat "$POD_RC_FILE" 2>/dev/null || true)"
-exit "${rc:-143}"
+wait "$POD_PID"; rc=$?
+[ -z "$SIG_SEEN" ] || docker rm -f "$POD_NAME" >/dev/null 2>&1 || true
+exit "$rc"
