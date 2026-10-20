@@ -169,8 +169,9 @@ DOCKER_FLAGS+=("--pids-limit=${PIDS:-4096}")
 #     per-run volume that only it and this pod mount, so other containers and local host users that
 #     can reach the sidecar's bridge IP can't use the daemon. The port is never published.
 #   - $PWD is mounted into the sidecar at the same path so `docker run -v "$PWD:..."` resolves. The
-#     sidecar user is uid 1000, so on hosts where your uid differs, inner containers may not be able
-#     to write to the project.
+#     sidecar user is uid 1000 and an inner container's root maps to it, so on hosts where your uid
+#     differs, inner containers cannot write to the project (the pod itself still can); see
+#     "Known limitation: host uid other than 1000" in docs/docker-sidecar.md.
 #   - Images, containers and volumes of the inner daemon vanish when the session ends, unless
 #     DOCKER_CACHE=1: then the daemon's data dir lives in a named volume (copilot-pod-docker-<SHA-256 of
 #     $PWD>, one per project) and image layers are reused across sessions. A named volume, not a host
