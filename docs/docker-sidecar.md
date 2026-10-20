@@ -45,7 +45,11 @@ host Docker  ──runs──▶  pod (copilot-pod image)         cap-drop=ALL, 
    but the client may still be writing the pod's output, and signalling it again cut that output and, from
    the third signal on, made it exit 1 instead of with the pod's status (measured: pod printing 1 MB on
    SIGTERM into a stalled reader, exit 7 expected: exit 1 and 65536 of 1000000 bytes before, exit 7 and all
-   bytes after; Docker's client says `got 3 SIGTERM/SIGINTs, forcefully exiting`).
+   bytes after; Docker's client says `got 3 SIGTERM/SIGINTs, forcefully exiting`). The same happens when the
+   pod ended by itself (so no stop ever succeeded, `POD_SEEN` stays empty) and the signal arrives while the
+   client still writes: the kill fallback is therefore used at most once (`POD_KILLED`), which is enough for a
+   container that does not exist yet (measured: pod printing 1 MB and exiting 0, TERM while the client was
+   stalled: exit 1 and 65536 bytes before, exit 0 and all bytes after).
 6. The pod gets `--init` (only with `DOCKER=1`): with a bare shell or node as PID 1 the stop signal is
    ignored and the pod dies only after the 10s grace period (exit 137). `--init` is not enough for the
    default command: interactive Bash (TTY) ignores SIGTERM even as a child of tini (measured with

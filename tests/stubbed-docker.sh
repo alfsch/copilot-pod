@@ -28,6 +28,9 @@ LAUNCHER="${LAUNCHER:-$ROOT/copilot-pod}"
 #   STUB_POD_LINGER=N     after `docker stop` the container is gone ("No such container") but the client
 #                         keeps running N more seconds, like a client still writing output; a second signal
 #                         to it is recorded in client-killed (the real client then exits 1 and cuts the output)
+#   STUB_POD_DRAIN=N      the container is already gone when the client starts (the pod ended by itself, --rm) but
+#                         the client keeps writing for N seconds; like Docker's client it survives two signals
+#                         and exits 1 on the third (client-killed)
 #   STUB_DERIVED_EXISTS=1 the derived sidecar image already exists; STUB_BUILD_FAIL=1 `docker build` fails
 cat >"$BIN/docker" <<'STUB'
 #!/usr/bin/env bash
@@ -59,10 +62,15 @@ case "$1" in
       fi
       : > "$STUB_DIR/sidecar"; echo sidecarid; exit 0
     fi
-    if [ -n "${STUB_POD_SLEEP:-}" ]; then
+    if [ -n "${STUB_POD_SLEEP:-}${STUB_POD_DRAIN:-}" ]; then
       : > "$STUB_DIR/pod-created"; sleep "${STUB_POD_CREATE_DELAY:-0}"
-      sleep "$STUB_POD_SLEEP" & s=$!
+      sleep "${STUB_POD_SLEEP:-$STUB_POD_DRAIN}" & s=$!
       term() {
+        if [ -n "${STUB_POD_DRAIN:-}" ]; then
+          echo x >> "$STUB_DIR/client-signals"
+          [ "$(wc -l < "$STUB_DIR/client-signals")" -ge 3 ] || return 0
+          : > "$STUB_DIR/client-killed"; exit 1
+        fi
         if [ -e "$STUB_DIR/pod-stopped" ]; then : > "$STUB_DIR/client-killed"; exit 1; fi
         kill $s 2>/dev/null
         if [ -n "${STUB_POD_LINGER:-}" ]; then : > "$STUB_DIR/pod-stopped"; sleep "$STUB_POD_LINGER" & wait $!; fi
@@ -71,7 +79,8 @@ case "$1" in
       trap term TERM
       echo $$ > "$STUB_DIR/pod.pid"
       echo started > "$STUB_DIR/pod-running"
-      wait $s
+      [ -z "${STUB_POD_DRAIN:-}" ] || : > "$STUB_DIR/pod-stopped"
+      while kill -0 $s 2>/dev/null; do wait $s 2>/dev/null; done
     fi
     exit "${STUB_POD_EXIT:-0}" ;;
   exec)
@@ -318,6 +327,13 @@ test_stop_while_client_drains() {   # the container is gone but its client is st
   [ "$(grep -c '^stop -t 10 copilot-pod-run-' "$STUB_LOG")" -le 2 ] || fail "stop was retried after the container was gone"
   order '^stop -t 10 copilot-pod-run-' '^rm -f -v sidecarid' '^network rm'
 }
+test_stop_after_natural_exit() {   # the pod ended by itself and its client is still writing: a stop request must not cut it
+  setup_case; launch_bg DOCKER=1 STUB_POD_DRAIN=4 -- true
+  wait_for "$STUB_DIR/pod-running"; kill -TERM "$LPID"; finish_bg
+  rc_is 0; [ ! -e "$STUB_DIR/client-killed" ] || fail "the client was signalled until it gave up while it was still writing"
+  [ "$(wc -l < "$STUB_DIR/client-signals")" -le 1 ] || fail "the client was signalled more than once"
+  order '^stop -t 10 copilot-pod-run-' '^rm -f -v sidecarid' '^network rm'
+}
 test_term_before_pod_pid() {   # a stop request in the gap before POD_PID is known must not be lost
   setup_case
   # The gap is microseconds wide, so inject the signal into a copy of the launcher right before the pod starts.
@@ -369,6 +385,7 @@ run_mutants() {
   mutate test_term_before_pod_pid $'  STOP_REQUESTED=1\n' '' || rc=1
   mutate test_stop_while_client_drains 'elif [ -n "$POD_SEEN" ]; then POD_GONE=1' 'elif false; then POD_GONE=1' || rc=1
   mutate test_stop_while_client_drains $'  [ -z "$POD_GONE" ] || return 0\n' '' || rc=1
+  mutate test_stop_after_natural_exit '[ -n "$POD_PID" ] && [ -z "$POD_KILLED" ]; then POD_KILLED=1;' '[ -n "$POD_PID" ]; then' || rc=1
   mutate test_term_running  'trap stop_pod TERM INT HUP' 'trap "" TERM INT HUP' || rc=1
   mutate test_int_hup_running 'trap stop_pod TERM INT HUP' 'trap stop_pod TERM' || rc=1
   mutate test_int_hup_startup "trap 'exit 130' INT" "trap 'exit 1' INT" || rc=1
