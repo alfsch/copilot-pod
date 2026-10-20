@@ -11,9 +11,11 @@ on:
 permissions:
   contents: read
 
-# A newer push to a pull request makes the older run obsolete; runs on main always finish.
+# A newer push to a pull request makes the older run obsolete. Every other run gets a group of its own: a group
+# keeps only one pending run and cancels older pending ones even without cancel-in-progress, which would drop
+# runs on main when pushes come in a burst.
 concurrency:
-  group: stub-tests-${{ github.ref }}
+  group: stub-tests-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
