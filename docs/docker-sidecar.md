@@ -110,9 +110,8 @@ up as a uid from that range on the host). Inner root then writes to the project 
   (macOS: Docker Desktop's file sharing handles ownership; not tested). WSL2 reports Linux and gets the
   derived image; not tested either.
 - The cache volume is owned by the sidecar's uid, so a derived image cannot use a volume created by the stock
-  image. The uid is therefore part of the cache hash, but only when the derived image is used: existing
-  caches of uid 1000 hosts keep their names, and a cache of another uid made before this change is orphaned
-  (the 90-day prune or `uninstall.sh` removes it).
+  image. The uid is therefore always part of the cache hash (`sha256(pwd -P, uid)`). Caches created before
+  that are not reused; the 90-day prune or `uninstall.sh` removes them.
 - `uninstall.sh` removes the `copilot-pod-dind` images. A new base digest from Renovate builds a new derived
   image on the next start; the old one stays until uninstall (a few MB of layers on top of the base).
 - Tests: the stub covers the decision (uid, root, `uname`, `DIND_IMAGE`), the build call and its failure and

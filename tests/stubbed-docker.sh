@@ -105,7 +105,7 @@ setup_case() {
   STATE="$H/state/copilot-pod/caches"
   mkdir -p "$PROJ" "$H"
   export STUB_LOG="$CASE/docker.log" STUB_DIR="$CASE/stub"; mkdir -p "$STUB_DIR"; : > "$STUB_LOG"
-  HASH="$(cd "$PROJ" && pwd -P | sha256sum | cut -c1-16)"
+  HASH="$(cd "$PROJ" && { pwd -P; echo 1000; } | sha256sum | cut -c1-16)"   # the stub reports uid 1000
 }
 launch_env() { cd "$PROJ" && HOME="$H" XDG_STATE_HOME="$H/state" COPILOT_POD_NO_UPDATE=1 PATH="$BIN:$PATH" "$@"; }
 launch() {   # launch <env VAR=...>... -- args   (foreground; sets RC)
@@ -319,7 +319,7 @@ run_mutants() {
   mutate test_host_uid_skipped '[ -z "$_dind_image_set" ] && ' '' || rc=1
   mutate test_host_uid_skipped '[ "$(uname -s)" = Linux ] && ' '' || rc=1
   mutate test_host_uid      'if [ -z "$(docker image ls -q "$DIND_IMAGE" 2>/dev/null)" ]; then' 'if true; then' || rc=1
-  mutate test_host_uid_cache '[ -z "$DIND_UID" ] || echo "$DIND_UID"' 'true' || rc=1
+  mutate test_host_uid_cache '{ pwd -P; id -u; }' '{ pwd -P; echo 1000; }' || rc=1
   mutate test_prune         '-mmin +$(( max_days * 1440 ))' '-mmin +0' || rc=1
   mutate test_prune         'elif grep -qi '"'"'no such volume'"'"' <<<"$out"; then' 'elif false; then' || rc=1
   mutate test_double_term_startup $'  trap \'\' INT TERM HUP\n' '' || rc=1

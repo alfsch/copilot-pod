@@ -284,9 +284,9 @@ EOF
     # SHA-256 (cut to 16 hex chars) so distinct projects can't share a cache; sha256sum on Linux,
     # shasum on macOS.
     # pwd -P: the same project reached via a symlink must map to the same cache.
-    # The derived image's user has another uid and could not use a volume owned by 1000, so the uid is
-    # part of the hash then (and only then: existing caches keep their names).
-    _hash="$({ pwd -P; [ -z "$DIND_UID" ] || echo "$DIND_UID"; } | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16)"
+    # The uid is part of the hash: the volume is owned by the sidecar's uid, and the derived image's user
+    # (another uid) could not use one created by the stock image.
+    _hash="$({ pwd -P; id -u; } | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16)"
     [[ "$_hash" =~ ^[0-9a-f]{16}$ ]] || die "Could not hash the project path (need sha256sum or shasum)."
     DIND_CACHE_VOL="copilot-pod-docker-$_hash"
     # A fixed sidecar name is the exclusive reservation: Docker refuses a second container with the
