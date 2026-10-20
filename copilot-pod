@@ -262,8 +262,10 @@ if [ -n "${DOCKER:-}" ]; then
     DIND_UID="$(id -u)"; DIND_GID="$(id -g)"
     # The subordinate id range for inner users stays at the image's 100000..165535 unless the host uid or gid
     # lies in it: inner root would then map to the same outer id as a subordinate id, which Linux rejects, and
-    # the sidecar would not start. In that case it starts right above the host ids.
-    _max=$(( DIND_UID > DIND_GID ? DIND_UID : DIND_GID )); _sub=$(( _max < 100000 ? 100000 : _max + 1 ))
+    # the sidecar would not start. Then the next free block of 65536 ids at 200000, 300000, ... is used (two ids
+    # block at most two of them, and a fixed step cannot run past the 32-bit limit).
+    _sub=100000
+    while (( (DIND_UID >= _sub && DIND_UID < _sub + 65536) || (DIND_GID >= _sub && DIND_GID < _sub + 65536) )); do _sub=$(( _sub + 100000 )); done
     _base="$DIND_IMAGE"; DIND_IMAGE="copilot-pod-dind:uid$DIND_UID-gid$DIND_GID-${_base##*:}"
     if [ -z "$(docker image ls -q "$DIND_IMAGE" 2>/dev/null)" ]; then
       printf '%s●%s Building Docker sidecar image for uid %s (first start only)...\n' "$BOLD" "$RESET" "$DIND_UID" >&2

@@ -213,7 +213,8 @@ test_host_uid() {   # Linux, uid other than 1000: derived sidecar image for that
   rc_is 0; not_logged '^build '; logged '^run -d .* copilot-pod-dind:uid1001-gid1002-'
 }
 test_host_uid_subid_range() {   # the subordinate id range must not contain the host uid or gid (else dockerd cannot start)
-  local c; for c in "1001 1002 100000" "100000 1001 100001" "1001 150000 150001" "165535 165536 165537" "200000 200000 200001"; do
+  local c; for c in "1001 1002 100000" "100000 1001 200000" "1001 150000 200000" "165535 165536 200000" "165536 1001 100000" \
+                    "150000 200000 300000" "200000 200000 100000" "4294960000 1000 100000" "1001 4294967293 100000"; do
     set -- $c; setup_case; launch DOCKER=1 STUB_UID=$1 STUB_GID=$2 -- true
     rc_is 0; logged " --build-arg U=$1 --build-arg G=$2 --build-arg SUB=$3 -\$"
   done
@@ -371,8 +372,10 @@ run_mutants() {
   mutate test_host_uid_cache 'echo "${DIND_UID:-1000}:${DIND_GID:-1000}"' 'echo "$(id -u):$(id -g)"' || rc=1
   mutate test_host_uid_cache 'echo "${DIND_UID:-1000}:${DIND_GID:-1000}"' 'echo 1000:1000' || rc=1
   mutate test_host_uid_cache 'echo "${DIND_UID:-1000}:${DIND_GID:-1000}"' 'echo "${DIND_UID:-1000}:1000"' || rc=1
-  mutate test_host_uid_subid_range '_sub=$(( _max < 100000 ? 100000 : _max + 1 ))' '_sub=100000' || rc=1
-  mutate test_host_uid_subid_range '_max=$(( DIND_UID > DIND_GID ? DIND_UID : DIND_GID ))' '_max=$DIND_UID' || rc=1
+  mutate test_host_uid_subid_range '(DIND_UID >= _sub && DIND_UID < _sub + 65536)' '0' || rc=1
+  mutate test_host_uid_subid_range '(DIND_GID >= _sub && DIND_GID < _sub + 65536)' '0' || rc=1
+  mutate test_host_uid_subid_range 'DIND_UID < _sub + 65536' 'DIND_UID < _sub + 1' || rc=1
+  mutate test_host_uid_subid_range 'DIND_GID < _sub + 65536' 'DIND_GID < _sub + 1' || rc=1
   mutate test_host_uid_subid_range ' | tee /etc/subuid > /etc/subgid' ' > /etc/subuid' || rc=1
   mutate test_prune         '-mmin +$(( max_days * 1440 ))' '-mmin +0' || rc=1
   mutate test_prune         'elif grep -qi '"'"'no such volume'"'"' <<<"$out"; then' 'elif false; then' || rc=1

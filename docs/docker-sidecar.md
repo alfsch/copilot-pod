@@ -118,9 +118,10 @@ up as a uid from that range on the host). Inner root then writes to the project 
 The subordinate range of the image is 100000..165535. If the host uid or gid lies inside it, inner root and a
 subordinate id would map to the same outer id, Linux rejects that map (`newuidmap: write to uid_map failed:
 Invalid argument`) and the sidecar does not start. This happens with accounts from a directory service. So
-the derived image writes its own range to `/etc/subuid` and `/etc/subgid`: 100000..165535 as before when
-both ids are below 100000, otherwise 65536 ids starting right above `max(uid, gid)`. Checked on a real daemon
-with host ids 100000/100000, 150000/1001 and 1001/165000 (sidecar starts; without the change the first two
+the derived image writes its own range to `/etc/subuid` and `/etc/subgid`: 100000..165535 as before unless
+the host uid or gid lies in it, then the first free block of 65536 ids at 200000, 300000, ... (two ids block
+at most two blocks, and a fixed step cannot run past the 32-bit id limit). Checked on a real daemon with
+host ids 100000/100000, 150000/1001 and 1001/165000 (sidecar starts; without the change the first two
 fail with the error above). An existing derived image keeps its old range, which only matters for ids that
 could not run before; `docker rmi` it to rebuild.
 
