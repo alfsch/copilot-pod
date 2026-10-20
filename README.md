@@ -174,7 +174,7 @@ Combine it with the other options if you like, e.g. `DOCKER=1 MEMORY=8g CPUS=4 P
 
 If it doesn't start, check that your own Docker can run privileged containers (the sidecar needs `--privileged`) and that you aren't also setting `NET=none`. A sidecar that never becomes ready prints its last log lines.
 
-How it works: `copilot-pod` starts a separate **rootless Docker-in-Docker sidecar** (`docker:28-dind-rootless`) on a private per-run network and points the pod's `docker` CLI at it. Only the sidecar runs `--privileged`; the pod keeps all its hardening (no capabilities, `no-new-privileges`, default seccomp). The host's Docker socket is never mounted. The daemon is only reachable with a per-run client certificate (mutual TLS), shared with the pod through a throwaway volume. The sidecar, network and volume are removed when the session ends, taking its images and containers with it. It works on Linux, macOS and Windows (WSL2).
+How it works: `copilot-pod` starts a separate **rootless Docker-in-Docker sidecar** (the pinned `docker:<major>-dind-rootless` image) on a private per-run network and points the pod's `docker` CLI at it. Only the sidecar runs `--privileged`; the pod keeps all its hardening (no capabilities, `no-new-privileges`, default seccomp). The host's Docker socket is never mounted. The daemon is only reachable with a per-run client certificate (mutual TLS), shared with the pod through a throwaway volume. The sidecar, network and volume are removed when the session ends, taking its images and containers with it. It works on Linux, macOS and Windows (WSL2).
 
 **Requirements for `DOCKER=1`**
 
