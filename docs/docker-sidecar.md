@@ -106,6 +106,15 @@ the entrypoint takes uid and paths from `id -u` and `$HOME`, and the subuid and 
 the user name, so they stay valid (inner containers still get a full range, so `chown 5000` works and shows
 up as a uid from that range on the host). Inner root then writes to the project as the host user.
 
+Only inner uid 0 and gid 0 map to the host user and group; every other inner id maps into the subordinate
+range. So an inner container running as a non-root user is not helped. Measured with uid 1001 and a folder
+owned by 1001:1001, mode 775, as `alpine:3` with `--user`: `1001:1001` and `1` are denied; `1001` and `1000`
+(no gid given, so gid 0) can write through the group, and the files then belong to subordinate uids
+(100999, 101000) on the host. Builds (`docker build`) and named volumes are not affected: builds only read the
+context and volumes live inside the sidecar. Making non-root inner users work would need the sidecar's id
+mapping to cover them (for example a mapping that includes the host uid inside the user namespace), which is
+not part of this feature.
+
 - A `DIND_IMAGE` set by the user is used as is, and so is a host with uid 1000 or 0 or a non-Linux `uname`
   (macOS: Docker Desktop's file sharing handles ownership; not tested). WSL2 reports Linux and gets the
   derived image; not tested either.
