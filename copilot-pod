@@ -257,17 +257,17 @@ if [ -n "${DOCKER:-}" ]; then
   # Linux host with a uid other than 1000 (not root, which rootless dockerd cannot use): renumber the
   # image's `rootless` user to the host uid, so inner containers can write to the project. A user-set
   # DIND_IMAGE is used as is. The tag contains the base digest, so a new pin gets a new derived image.
-  DIND_UID=
+  DIND_UID=; DIND_GID=
   if [ -z "$_dind_image_set" ] && [ "$(uname -s)" = Linux ] && [ "$(id -u)" != 1000 ] && [ "$(id -u)" != 0 ]; then
-    DIND_UID="$(id -u)"; _gid="$(id -g)"
+    DIND_UID="$(id -u)"; DIND_GID="$(id -g)"
     # The subordinate id range for inner users stays at the image's 100000..165535 unless the host uid or gid
     # lies in it: inner root would then map to the same outer id as a subordinate id, which Linux rejects, and
     # the sidecar would not start. In that case it starts right above the host ids.
-    _max=$(( DIND_UID > _gid ? DIND_UID : _gid )); _sub=$(( _max < 100000 ? 100000 : _max + 1 ))
-    _base="$DIND_IMAGE"; DIND_IMAGE="copilot-pod-dind:uid$DIND_UID-gid$_gid-${_base##*:}"
+    _max=$(( DIND_UID > DIND_GID ? DIND_UID : DIND_GID )); _sub=$(( _max < 100000 ? 100000 : _max + 1 ))
+    _base="$DIND_IMAGE"; DIND_IMAGE="copilot-pod-dind:uid$DIND_UID-gid$DIND_GID-${_base##*:}"
     if [ -z "$(docker image ls -q "$DIND_IMAGE" 2>/dev/null)" ]; then
       printf '%s●%s Building Docker sidecar image for uid %s (first start only)...\n' "$BOLD" "$RESET" "$DIND_UID" >&2
-      docker build -q -t "$DIND_IMAGE" --build-arg "BASE=$_base" --build-arg "U=$DIND_UID" --build-arg "G=$_gid" --build-arg "SUB=$_sub" - >/dev/null <<'EOF' \
+      docker build -q -t "$DIND_IMAGE" --build-arg "BASE=$_base" --build-arg "U=$DIND_UID" --build-arg "G=$DIND_GID" --build-arg "SUB=$_sub" - >/dev/null <<'EOF' \
         || die "Could not build the Docker sidecar image for uid $DIND_UID."
 ARG BASE
 FROM $BASE
@@ -290,9 +290,10 @@ EOF
     # SHA-256 (cut to 16 hex chars) so distinct projects can't share a cache; sha256sum on Linux,
     # shasum on macOS.
     # pwd -P: the same project reached via a symlink must map to the same cache.
-    # The sidecar's uid is part of the hash: the volume is owned by it, and a sidecar with another uid (the
-    # derived image, or the stock image's 1000) could not use it. DIND_UID is set only for the derived image.
-    _hash="$({ pwd -P; echo "${DIND_UID:-1000}"; } | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16)"
+    # The sidecar's uid and gid are part of the hash: the volume is owned by them, and a sidecar with other ids
+    # (the derived image, or the stock image's 1000:1000) could not use it. DIND_UID and DIND_GID are set only
+    # for the derived image.
+    _hash="$({ pwd -P; echo "${DIND_UID:-1000}:${DIND_GID:-1000}"; } | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16)"
     [[ "$_hash" =~ ^[0-9a-f]{16}$ ]] || die "Could not hash the project path (need sha256sum or shasum)."
     DIND_CACHE_VOL="copilot-pod-docker-$_hash"
     # A fixed sidecar name is the exclusive reservation: Docker refuses a second container with the

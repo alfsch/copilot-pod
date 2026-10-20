@@ -133,8 +133,9 @@ not part of this feature.
   (macOS: Docker Desktop's file sharing handles ownership; not tested). WSL2 reports Linux and gets the
   derived image; not tested either.
 - The cache volume is owned by the sidecar's uid, so a sidecar with another uid cannot use it. The sidecar's
-  uid is therefore part of the cache hash: `sha256(pwd -P, uid)`, with the host uid for the derived image
-  and 1000 for the stock image (also with a user-set `DIND_IMAGE`, which is assumed to be a stock-like image).
+  uid and gid are therefore part of the cache hash: `sha256(pwd -P, uid:gid)`, with the host ids for the derived
+  image (so another primary group, as with `sg`, gets another volume) and 1000:1000 for the stock image (also
+  with a user-set `DIND_IMAGE`, which is assumed to be a stock-like image).
   Caches created before that are not reused; the 90-day prune or `uninstall.sh` removes them.
 - `uninstall.sh` removes the `copilot-pod-dind:*` tags, and only those (not other tags the images may have). A new base digest from Renovate builds a new derived
   image on the next start; the old one stays until uninstall (a few MB of layers on top of the base).

@@ -115,7 +115,7 @@ setup_case() {
   STATE="$H/state/copilot-pod/caches"
   mkdir -p "$PROJ" "$H"
   export STUB_LOG="$CASE/docker.log" STUB_DIR="$CASE/stub"; mkdir -p "$STUB_DIR"; : > "$STUB_LOG"
-  HASH="$(cd "$PROJ" && { pwd -P; echo 1000; } | sha256sum | cut -c1-16)"   # the stub reports uid 1000
+  HASH="$(cd "$PROJ" && { pwd -P; echo 1000:1000; } | sha256sum | cut -c1-16)"   # the stub reports uid and gid 1000
 }
 launch_env() { cd "$PROJ" && HOME="$H" XDG_STATE_HOME="$H/state" COPILOT_POD_NO_UPDATE=1 PATH="$BIN:$PATH" "$@"; }
 launch() {   # launch <env VAR=...>... -- args   (foreground; sets RC)
@@ -224,9 +224,13 @@ test_host_uid_build_fails() {   # no sidecar without its image
 }
 test_host_uid_cache() {   # the cache volume of the derived image is separate from the one owned by uid 1000
   setup_case; launch DOCKER=1 DOCKER_CACHE=1 STUB_UID=1001 -- true
-  local h; h="$(cd "$PROJ" && { pwd -P; echo 1001; } | sha256sum | cut -c1-16)"
+  local h; h="$(cd "$PROJ" && { pwd -P; echo 1001:1000; } | sha256sum | cut -c1-16)"
   rc_is 0; in_out "created new copilot-pod-docker-$h"; logged "^run -d .*--name copilot-pod-dind-cache-$h "
   [ "$h" != "$HASH" ] || fail "uid not part of the hash"
+  # same uid, other primary group (sg, newgrp): another derived image, so another volume
+  setup_case; launch DOCKER=1 DOCKER_CACHE=1 STUB_UID=1001 STUB_GID=1002 -- true
+  local h2; h2="$(cd "$PROJ" && { pwd -P; echo 1001:1002; } | sha256sum | cut -c1-16)"
+  rc_is 0; in_out "created new copilot-pod-docker-$h2"; [ "$h2" != "$h" ] || fail "gid not part of the hash"
   # a user-set DIND_IMAGE keeps the stock image (uid 1000): same cache as on a uid 1000 host, not the derived one
   setup_case; launch DOCKER=1 DOCKER_CACHE=1 STUB_UID=1001 DIND_IMAGE=my/dind:1 -- true
   rc_is 0; in_out "created new copilot-pod-docker-$HASH"
@@ -348,10 +352,11 @@ run_mutants() {
   mutate test_host_uid_skipped '[ -z "$_dind_image_set" ] && ' '' || rc=1
   mutate test_host_uid_skipped '[ "$(uname -s)" = Linux ] && ' '' || rc=1
   mutate test_host_uid      'if [ -z "$(docker image ls -q "$DIND_IMAGE" 2>/dev/null)" ]; then' 'if true; then' || rc=1
-  mutate test_host_uid_cache '{ pwd -P; echo "${DIND_UID:-1000}"; }' '{ pwd -P; id -u; }' || rc=1
-  mutate test_host_uid_cache '{ pwd -P; echo "${DIND_UID:-1000}"; }' '{ pwd -P; echo 1000; }' || rc=1
+  mutate test_host_uid_cache 'echo "${DIND_UID:-1000}:${DIND_GID:-1000}"' 'echo "$(id -u):$(id -g)"' || rc=1
+  mutate test_host_uid_cache 'echo "${DIND_UID:-1000}:${DIND_GID:-1000}"' 'echo 1000:1000' || rc=1
+  mutate test_host_uid_cache 'echo "${DIND_UID:-1000}:${DIND_GID:-1000}"' 'echo "${DIND_UID:-1000}:1000"' || rc=1
   mutate test_host_uid_subid_range '_sub=$(( _max < 100000 ? 100000 : _max + 1 ))' '_sub=100000' || rc=1
-  mutate test_host_uid_subid_range '_max=$(( DIND_UID > _gid ? DIND_UID : _gid ))' '_max=$DIND_UID' || rc=1
+  mutate test_host_uid_subid_range '_max=$(( DIND_UID > DIND_GID ? DIND_UID : DIND_GID ))' '_max=$DIND_UID' || rc=1
   mutate test_host_uid_subid_range ' | tee /etc/subuid > /etc/subgid' ' > /etc/subuid' || rc=1
   mutate test_prune         '-mmin +$(( max_days * 1440 ))' '-mmin +0' || rc=1
   mutate test_prune         'elif grep -qi '"'"'no such volume'"'"' <<<"$out"; then' 'elif false; then' || rc=1
