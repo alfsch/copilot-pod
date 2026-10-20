@@ -120,14 +120,14 @@ setup_case() {
 launch_env() { cd "$PROJ" && HOME="$H" XDG_STATE_HOME="$H/state" COPILOT_POD_NO_UPDATE=1 PATH="$BIN:$PATH" "$@"; }
 launch() {   # launch <env VAR=...>... -- args   (foreground; sets RC)
   local envs=(); while [ "$1" != -- ]; do envs+=("$1"); shift; done; shift
-  RC=0; (launch_env env "${envs[@]}" timeout 60 "$LAUNCHER" "$@" </dev/null >"$CASE/out" 2>"$CASE/err") || RC=$?
+  RC=0; (launch_env env ${envs[@]+"${envs[@]}"} timeout 60 "$LAUNCHER" "$@" </dev/null >"$CASE/out" 2>"$CASE/err") || RC=$?
 }
 launch_bg() { # same, background; sets LPID
   local envs=(); while [ "$1" != -- ]; do envs+=("$1"); shift; done; shift
   # Job control (set -m) gives the background launcher default signal dispositions; without it a non-interactive
   # shell starts async commands with SIGINT ignored, and bash cannot trap a signal that was ignored on entry.
   set -m
-  (launch_env exec env "${envs[@]}" "$LAUNCHER" "$@" </dev/null >"$CASE/out" 2>"$CASE/err") &
+  (launch_env exec env ${envs[@]+"${envs[@]}"} "$LAUNCHER" "$@" </dev/null >"$CASE/out" 2>"$CASE/err") &
   LPID=$!
   set +m
   ( sleep 45; kill -9 "$LPID" 2>/dev/null ) & WD=$!
