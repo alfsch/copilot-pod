@@ -41,6 +41,13 @@
       "pinDigests": true
     },
     {
+      "description": "Merge updates of the tooling images (docker CLI, DIND sidecar, node base image, yq), majors included, once the required stub-tests and integration-tests checks pass; the integration tests are what vouches for them. No minimumReleaseAge: Renovate has no release timestamps for these docker updates, and with timestamp-required it would hold them back forever",
+      "matchDatasources": ["docker"],
+      "automerge": true,
+      "automergeType": "pr",
+      "automergeStrategy": "squash"
+    },
+    {
       "description": "Merge GitHub Actions updates once the required stub-tests check passes, but not before a release is 3 days old; main only accepts squash merges",
       "matchManagers": ["github-actions"],
       "minimumReleaseAge": "3 days",
