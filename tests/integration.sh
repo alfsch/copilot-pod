@@ -39,7 +39,8 @@ BG_PIDS=()
 # The names of the resources a session creates, now and after the tests: whatever exists afterwards and did not
 # before is what the tests left behind. Sessions of other users of this daemon, starting or ending, do not matter.
 snapshot() {
-  { docker ps -a --filter label=copilot-pod.run --format 'container {{.Names}}'
+  { docker ps -a --filter label=copilot-pod.run --format 'sidecar {{.Names}}'
+    docker ps -a --filter name=copilot-pod-run- --format 'pod {{.Names}}'
     docker network ls --filter name=copilot-pod-net- --format 'network {{.Name}}'
     docker volume ls --filter name=copilot-pod-certs- --format 'volume {{.Name}}'; } 2>/dev/null | sort
 }
