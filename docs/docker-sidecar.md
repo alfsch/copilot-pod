@@ -169,7 +169,9 @@ requests and pushes to main) and need no Docker daemon. `tests/integration.sh` r
 Dockerfile): the tools in the pod image, the contract of the pinned sidecar image (the `rootless` user, subuid and
 subgid ranges, `newuidmap`, data dir), a `DOCKER=1` session with inner `run`/`build`/`compose` and project writes,
 exit codes, the cache (create, reuse, exclusivity, prune), TLS refusals, SIGTERM and that nothing is left behind.
-Its purpose is to tell an update of a tooling image (docker CLI, DIND sidecar, node base, yq) from a broken one.
+Its purpose is to tell an update of a tooling image (docker CLI, DIND sidecar, node base, yq) from a broken one:
+Renovate merges such updates, majors included, once the required checks pass (`renovate.json`), so these tests are the
+only review they get and must not name a version that Renovate bumps.
 It asserts results and exit codes only, never timings, which are flaky on shared runners, and assumes that no other
 copilot-pod session starts on the same daemon while it runs (its leak check compares names before and after); the checklist below
 covers what it does not (signal timing, macOS, WSL2). Run it locally with a daemon and the `copilot-pod` image

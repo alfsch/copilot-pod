@@ -21,6 +21,10 @@ Runs the GitHub Copilot CLI in a hardened Docker container scoped to the current
   fail without the fix (see the docs). Anything that needs a real daemon (rootless sidecar, TLS, cache volumes,
   signals) is covered by `tests/integration.sh` (run by `.github/workflows/integration-tests.yaml`) and, for
   what that does not check, by the checklist in `docs/docker-sidecar.md`, on a host with Docker.
+- Renovate merges updates of GitHub Actions and of the tooling images (docker CLI, DIND sidecar, node base image,
+  yq), majors included, as soon as the required checks pass (`renovate.json`), so those checks are the only
+  review such an update gets. If a merged update breaks something the tests did not notice, the fix includes a
+  new test for it. A test must not name a version Renovate bumps (a stub test once expected `docker:28-...`).
 - Rootless DinD needs unprivileged user namespaces; on Ubuntu 24.04+ that means
   `kernel.apparmor_restrict_unprivileged_userns=0` for the test (set it back to `1` afterwards).
 - After every edit run `for f in copilot-pod install.sh uninstall.sh tests/stubbed-docker.sh; do bash -n "$f"; done`
