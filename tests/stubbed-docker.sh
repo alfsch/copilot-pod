@@ -195,13 +195,21 @@ test_cache_conflict() {   # name already taken: refuse, point at the leftover, t
 test_host_uid() {   # Linux, uid other than 1000: derived sidecar image for that uid, built once, before the sidecar
   setup_case; launch DOCKER=1 STUB_UID=1001 STUB_GID=1002 -- true
   rc_is 0
-  logged '^build -q -t copilot-pod-dind:uid1001-gid1002-[0-9a-f]{64} --build-arg BASE=docker:28-dind-rootless@sha256:[0-9a-f]{64} --build-arg U=1001 --build-arg G=1002 -$'
+  logged '^build -q -t copilot-pod-dind:uid1001-gid1002-[0-9a-f]{64} --build-arg BASE=docker:28-dind-rootless@sha256:[0-9a-f]{64} --build-arg U=1001 --build-arg G=1002 --build-arg SUB=100000 -$'
   logged '^run -d --privileged --init .* copilot-pod-dind:uid1001-gid1002-[0-9a-f]{64}$'
   order '^build ' '^network create' '^run -d'
   grep -q 'rootless:x:\$U:\$G:' "$STUB_DIR/dockerfile" || fail "Dockerfile does not renumber the rootless user"
   in_out 'Building Docker sidecar image for uid 1001'
   setup_case; launch DOCKER=1 STUB_UID=1001 STUB_GID=1002 STUB_DERIVED_EXISTS=1 -- true   # already built: reused
   rc_is 0; not_logged '^build '; logged '^run -d .* copilot-pod-dind:uid1001-gid1002-'
+}
+test_host_uid_subid_range() {   # the subordinate id range must not contain the host uid or gid (else dockerd cannot start)
+  local c; for c in "1001 1002 100000" "100000 1001 100001" "1001 150000 150001" "165535 165536 165537" "200000 200000 200001"; do
+    set -- $c; setup_case; launch DOCKER=1 STUB_UID=$1 STUB_GID=$2 -- true
+    rc_is 0; logged " --build-arg U=$1 --build-arg G=$2 --build-arg SUB=$3 -\$"
+  done
+  grep -q 'rootless:\$SUB:65536' "$STUB_DIR/dockerfile" || fail "Dockerfile does not write the subordinate range"
+  grep -q '/etc/subuid' "$STUB_DIR/dockerfile" && grep -q '/etc/subgid' "$STUB_DIR/dockerfile" || fail "range written to only one of subuid/subgid"
 }
 test_host_uid_skipped() {   # stock image: uid 1000, root, a non-Linux host, a user-set DIND_IMAGE
   local c; for c in "STUB_UID=1000" "STUB_UID=0" "STUB_UID=1001 STUB_UNAME=Darwin" "STUB_UID=1001 DIND_IMAGE=my/dind:1"; do
@@ -342,6 +350,9 @@ run_mutants() {
   mutate test_host_uid      'if [ -z "$(docker image ls -q "$DIND_IMAGE" 2>/dev/null)" ]; then' 'if true; then' || rc=1
   mutate test_host_uid_cache '{ pwd -P; echo "${DIND_UID:-1000}"; }' '{ pwd -P; id -u; }' || rc=1
   mutate test_host_uid_cache '{ pwd -P; echo "${DIND_UID:-1000}"; }' '{ pwd -P; echo 1000; }' || rc=1
+  mutate test_host_uid_subid_range '_sub=$(( _max < 100000 ? 100000 : _max + 1 ))' '_sub=100000' || rc=1
+  mutate test_host_uid_subid_range '_max=$(( DIND_UID > _gid ? DIND_UID : _gid ))' '_max=$DIND_UID' || rc=1
+  mutate test_host_uid_subid_range ' | tee /etc/subuid > /etc/subgid' ' > /etc/subuid' || rc=1
   mutate test_prune         '-mmin +$(( max_days * 1440 ))' '-mmin +0' || rc=1
   mutate test_prune         'elif grep -qi '"'"'no such volume'"'"' <<<"$out"; then' 'elif false; then' || rc=1
   mutate test_double_term_startup $'  trap \'\' INT TERM HUP\n' '' || rc=1

@@ -111,6 +111,15 @@ the entrypoint takes uid and paths from `id -u` and `$HOME`, and the subuid and 
 the user name, so they stay valid (inner containers still get a full range, so `chown 5000` works and shows
 up as a uid from that range on the host). Inner root then writes to the project as the host user.
 
+The subordinate range of the image is 100000..165535. If the host uid or gid lies inside it, inner root and a
+subordinate id would map to the same outer id, Linux rejects that map (`newuidmap: write to uid_map failed:
+Invalid argument`) and the sidecar does not start. This happens with accounts from a directory service. So
+the derived image writes its own range to `/etc/subuid` and `/etc/subgid`: 100000..165535 as before when
+both ids are below 100000, otherwise 65536 ids starting right above `max(uid, gid)`. Checked on a real daemon
+with host ids 100000/100000, 150000/1001 and 1001/165000 (sidecar starts; without the change the first two
+fail with the error above). An existing derived image keeps its old range, which only matters for ids that
+could not run before; `docker rmi` it to rebuild.
+
 Only inner uid 0 and gid 0 map to the host user and group; every other inner id maps into the subordinate
 range. So an inner container running as a non-root user is not helped. Measured with uid 1001 and a folder
 owned by 1001:1001, mode 775, as `alpine:3` with `--user`: `1001:1001` and `1` are denied; `1001` and `1000`

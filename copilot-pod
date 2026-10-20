@@ -259,19 +259,25 @@ if [ -n "${DOCKER:-}" ]; then
   # DIND_IMAGE is used as is. The tag contains the base digest, so a new pin gets a new derived image.
   DIND_UID=
   if [ -z "$_dind_image_set" ] && [ "$(uname -s)" = Linux ] && [ "$(id -u)" != 1000 ] && [ "$(id -u)" != 0 ]; then
-    DIND_UID="$(id -u)"
-    _base="$DIND_IMAGE"; DIND_IMAGE="copilot-pod-dind:uid$DIND_UID-gid$(id -g)-${_base##*:}"
+    DIND_UID="$(id -u)"; _gid="$(id -g)"
+    # The subordinate id range for inner users stays at the image's 100000..165535 unless the host uid or gid
+    # lies in it: inner root would then map to the same outer id as a subordinate id, which Linux rejects, and
+    # the sidecar would not start. In that case it starts right above the host ids.
+    _max=$(( DIND_UID > _gid ? DIND_UID : _gid )); _sub=$(( _max < 100000 ? 100000 : _max + 1 ))
+    _base="$DIND_IMAGE"; DIND_IMAGE="copilot-pod-dind:uid$DIND_UID-gid$_gid-${_base##*:}"
     if [ -z "$(docker image ls -q "$DIND_IMAGE" 2>/dev/null)" ]; then
       printf '%s●%s Building Docker sidecar image for uid %s (first start only)...\n' "$BOLD" "$RESET" "$DIND_UID" >&2
-      docker build -q -t "$DIND_IMAGE" --build-arg "BASE=$_base" --build-arg "U=$DIND_UID" --build-arg "G=$(id -g)" - >/dev/null <<'EOF' \
+      docker build -q -t "$DIND_IMAGE" --build-arg "BASE=$_base" --build-arg "U=$DIND_UID" --build-arg "G=$_gid" --build-arg "SUB=$_sub" - >/dev/null <<'EOF' \
         || die "Could not build the Docker sidecar image for uid $DIND_UID."
 ARG BASE
 FROM $BASE
 ARG U
 ARG G
+ARG SUB
 USER root
 RUN sed -i "s/^rootless:x:1000:1000:/rootless:x:$U:$G:/" /etc/passwd \
  && sed -i "s/^rootless:x:1000:/rootless:x:$G:/" /etc/group \
+ && echo "rootless:$SUB:65536" | tee /etc/subuid > /etc/subgid \
  && chown -R $U:$G /home/rootless
 USER rootless
 EOF
