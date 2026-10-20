@@ -1,6 +1,6 @@
 name: macOS probe
 
-# Throwaway: what can a hosted macOS runner do for this project? Not meant to be merged.
+# Throwaway: can a hosted macOS runner run Docker (Colima) and the integration tests? Not meant to be merged.
 on:
   pull_request:
 
@@ -16,70 +16,61 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-latest, macos-15-intel]
+        include:
+          - os: macos-15-intel
+            wait: 90   # x 10 s per attempt
+          - os: macos-latest
+            wait: 30
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
 
-      - name: Machine
-        continue-on-error: true
-        run: |
-          uname -a; sw_vers; uname -m
-          echo "--- hypervisor support (1 = Hypervisor.framework usable)"
-          sysctl kern.hv_support || true
-          sysctl machdep.cpu.features 2>/dev/null | tr ' ' '\n' | grep -E '^VMX$' || echo "no VMX flag visible"
-          echo "--- bash"; /bin/bash --version | head -1; echo "PATH bash: $(command -v bash)"; bash --version | head -1
-          echo "--- tools the tests and the launcher use"
-          for t in docker colima lima limactl qemu-system-x86_64 qemu-system-aarch64 sha256sum shasum timeout gtimeout curl openssl jq python3 shellcheck; do printf '%-22s %s\n' "$t" "$(command -v $t || echo '-')"; done
-          echo "--- date/touch/stat flavour"; date -d '3 days ago' +%F 2>&1 | head -1; touch -d '3 days ago' /tmp/x 2>&1 | head -1; stat -c %u /tmp 2>&1 | head -1
-
-      - name: Syntax check with the system Bash 3.2
-        continue-on-error: true
-        run: |
-          rc=0
-          for f in copilot-pod install.sh uninstall.sh tests/stubbed-docker.sh tests/integration.sh; do
-            /bin/bash -n "$f" || rc=1
-          done
-          exit "$rc"
-
-      # macOS has no timeout(1): each test gets a 40 second watchdog. No `set -e` here: a killed test must not end the step.
-      - name: Stub tests, one by one (system Bash 3.2 first in PATH)
+      - name: Colima (qemu, then vz), time-boxed
+        id: colima
         continue-on-error: true
         run: |
           set +e
-          export PATH=/bin:/usr/bin:$PATH
-          for t in $(grep -o '^test_[a-z_0-9]*' tests/stubbed-docker.sh); do
-            start=$(date +%s)
-            /bin/bash tests/stubbed-docker.sh "$t" > "$RUNNER_TEMP/t.out" 2>&1 &
+          sysctl kern.hv_support
+          brew install qemu colima docker 2>&1 | tail -3
+          try_start() {
+            echo "=== colima start --vm-type $1"
+            colima start --vm-type "$1" --cpu 2 --memory 4 --disk 20 --mount "$HOME:w" > "$RUNNER_TEMP/colima-$1.out" 2>&1 &
             p=$!
-            ( sleep 40; kill "$p" 2>/dev/null ) &
-            w=$!
-            wait "$p"; rc=$?
-            kill "$w" 2>/dev/null
-            if [ "$rc" = 0 ]; then r=ok; elif [ "$rc" = 143 ] || [ "$rc" = 137 ]; then r=HANG/SLOW; else r="FAIL($rc)"; fi
-            printf '%-36s %-10s %ss\n' "$t" "$r" "$(( $(date +%s) - start ))"
-            [ "$r" = ok ] || { grep -E 'FAIL:|not found|illegal|unbound|syntax' "$RUNNER_TEMP/t.out" | head -3 | sed 's/^/      /'; }
-          done
+            for i in $(seq 1 ${{ matrix.wait }}); do kill -0 "$p" 2>/dev/null || break; sleep 10; done
+            if kill -0 "$p" 2>/dev/null; then echo "(still starting after the time box: killed)"; kill "$p" 2>/dev/null; fi
+            wait "$p" 2>/dev/null
+            tail -25 "$RUNNER_TEMP/colima-$1.out"
+            docker info > "$RUNNER_TEMP/docker-info.out" 2>&1
+          }
+          ok=
+          if try_start qemu; then ok=qemu; else colima delete -f >/dev/null 2>&1; if try_start vz; then ok=vz; fi; fi
+          if [ -n "$ok" ]; then
+            echo "DOCKER WORKS via colima --vm-type $ok"; head -12 "$RUNNER_TEMP/docker-info.out"
+            echo "docker=$ok" >> "$GITHUB_OUTPUT"
+            docker run --rm hello-world 2>&1 | sed -n '1,4p'
+          else
+            echo "NO DOCKER: both vm types failed"; head -5 "$RUNNER_TEMP/docker-info.out"
+            ls ~/.colima/_lima/colima 2>/dev/null; tail -15 ~/.colima/_lima/colima/ha.stderr.log 2>/dev/null
+          fi
           exit 0
 
-      - name: Docker on this runner? (Colima via brew, time-boxed)
+      - name: Build the image and run the integration tests (only if Docker works)
+        if: steps.colima.outputs.docker != ''
         continue-on-error: true
         run: |
           set +e
-          echo "--- docker before: $(command -v docker || echo none)"
-          brew install colima docker 2>&1 | tail -2
-          colima start --vm-type qemu --cpu 2 --memory 4 --disk 20 > "$RUNNER_TEMP/colima.out" 2>&1 &
+          ./install.sh 2>&1 | tail -8
+          export ITEST_TMPDIR="$HOME/itest"
+          tests/integration.sh > "$RUNNER_TEMP/itest.out" 2>&1 &
           p=$!
-          for i in $(seq 1 36); do
-            kill -0 "$p" 2>/dev/null || break
-            sleep 10
-          done
-          kill "$p" 2>/dev/null
-          echo "--- colima start output (tail):"; tail -40 "$RUNNER_TEMP/colima.out"
-          echo "--- docker info:"; docker info 2>&1 | head -8
-          colima list 2>&1
-          echo "--- lima logs"; ls ~/.colima/_lima/colima 2>/dev/null; tail -20 ~/.colima/_lima/colima/ha.stderr.log 2>/dev/null
+          ( sleep 1500; kill "$p" 2>/dev/null ) &
+          w=$!
+          wait "$p"; rc=$?
+          kill "$w" 2>/dev/null
+          echo "integration tests exit: $rc"
+          grep -E '^(FAIL|[0-9]+ passed|host uid)' "$RUNNER_TEMP/itest.out" | head -40
+          echo "--- full output tail"; tail -40 "$RUNNER_TEMP/itest.out"
           exit 0
