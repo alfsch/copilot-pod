@@ -1,0 +1,56 @@
+name: macOS probe
+
+# Throwaway: what can a hosted macOS runner do for this project? Not meant to be merged.
+on:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, macos-15-intel]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Machine
+        continue-on-error: true
+        run: |
+          uname -a; sw_vers; uname -m
+          echo "--- hypervisor support (1 = Hypervisor.framework usable)"
+          sysctl kern.hv_support || true
+          sysctl machdep.cpu.features 2>/dev/null | tr ' ' '\n' | grep -E '^VMX$' || echo "no VMX flag visible"
+          echo "--- bash"; /bin/bash --version | head -1; echo "PATH bash: $(command -v bash)"; bash --version | head -1
+          echo "--- tools the tests and the launcher use"
+          for t in docker colima lima limactl qemu-system-x86_64 qemu-system-aarch64 sha256sum shasum timeout gtimeout curl openssl jq python3 shellcheck; do printf '%-22s %s\n' "$t" "$(command -v $t || echo '-')"; done
+          echo "--- date/touch/stat flavour"; date -d '3 days ago' +%F 2>&1 | head -1; touch -d '3 days ago' /tmp/x 2>&1 | head -1; stat -c %u /tmp 2>&1 | head -1
+
+      - name: Syntax check with the system Bash 3.2
+        continue-on-error: true
+        run: |
+          rc=0
+          for f in copilot-pod install.sh uninstall.sh tests/stubbed-docker.sh tests/integration.sh; do
+            /bin/bash -n "$f" || rc=1
+          done
+          exit "$rc"
+
+      - name: Stub tests (system Bash 3.2 first in PATH)
+        continue-on-error: true
+        run: PATH=/bin:/usr/bin:$PATH /bin/bash tests/stubbed-docker.sh 2>&1 | grep -v '^  ok ' | head -80
+
+      - name: Docker on this runner?
+        continue-on-error: true
+        run: |
+          docker version 2>&1 | head -5 || true
+          echo "--- colima via brew (qemu), time-boxed"
+          brew install colima docker 2>&1 | tail -3
+          ( colima start --vm-type qemu --cpu 2 --memory 4 --disk 20 2>&1 | tail -25 ) &
+          sleep 600; docker info 2>&1 | head -8 || true; colima status 2>&1 | head -5 || true
+          colima list 2>&1 || true
