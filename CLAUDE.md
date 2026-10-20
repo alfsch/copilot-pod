@@ -19,7 +19,8 @@ Runs the GitHub Copilot CLI in a hardened Docker container scoped to the current
 - The stub tests (`tests/stubbed-docker.sh`, run by `.github/workflows/stub-tests.yaml` on pull requests) need
   no Docker daemon, which the Claude sandbox usually lacks. Test launcher changes with them, and make each test
   fail without the fix (see the docs). Anything that needs a real daemon (rootless sidecar, TLS, cache volumes,
-  signals) has to be run on a host with Docker; the checklist is in `docs/docker-sidecar.md`.
+  signals) is covered by `tests/integration.sh` (run by `.github/workflows/integration-tests.yaml`) and, for
+  what that does not check, by the checklist in `docs/docker-sidecar.md`, on a host with Docker.
 - Rootless DinD needs unprivileged user namespaces; on Ubuntu 24.04+ that means
   `kernel.apparmor_restrict_unprivileged_userns=0` for the test (set it back to `1` afterwards).
 - After every edit run `for f in copilot-pod install.sh uninstall.sh tests/stubbed-docker.sh; do bash -n "$f"; done`

@@ -164,8 +164,15 @@ section "Requirements for DOCKER=1" (sysctl.d setting and how to undo it). For t
 ## Testing
 
 The stub tests run in CI (`.github/workflows/stub-tests.yaml`: syntax check, ShellCheck and the suite, on pull
-requests and pushes to main); nothing in CI needs a Docker daemon, so the real-Docker checklist below stays manual.
-Two layers have been used:
+requests and pushes to main) and need no Docker daemon. `tests/integration.sh` runs the essential real-daemon checks
+(`.github/workflows/integration-tests.yaml`, a real `ubuntu-latest` daemon with the image built from the
+Dockerfile): the tools in the pod image, the contract of the pinned sidecar image (the `rootless` user, subuid and
+subgid ranges, `newuidmap`, data dir), a `DOCKER=1` session with inner `run`/`build`/`compose` and project writes,
+exit codes, the cache (create, reuse, exclusivity, prune), TLS refusals, SIGTERM and that nothing is left behind.
+Its purpose is to tell an update of a tooling image (docker CLI, DIND sidecar, node base, yq) from a broken one.
+It asserts results and exit codes only, never timings, which are flaky on shared runners; the checklist below
+covers what it does not (signal timing, macOS, WSL2). Run it locally with a daemon and the `copilot-pod` image
+(`./install.sh`): `ITEST_TMPDIR=<a directory the daemon can see> tests/integration.sh`. Two layers have been used:
 
 **Stubbed `docker`** (no daemon needed): `tests/stubbed-docker.sh` runs the cases below and then a set of
 mutants (the launcher with one fix removed) that each must make a test fail. Run it after every launcher
