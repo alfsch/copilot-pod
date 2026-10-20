@@ -18,6 +18,7 @@ info "Will remove"
 printf '  %simage:%s %s\n' "$DIM" "$RESET" "$IMAGE"
 printf '  %sdir:  %s %s %s(auth + session history)%s\n' "$DIM" "$RESET" "$STATE_DIR" "$DIM" "$RESET"
 printf '  %svolumes:%s copilot-pod-docker-* %s(DOCKER_CACHE image caches, if any)%s\n' "$DIM" "$RESET" "$DIM" "$RESET"
+printf '  %simages:%s copilot-pod-dind:* %s(DOCKER=1 sidecar images for a host uid other than 1000, if any)%s\n' "$DIM" "$RESET" "$DIM" "$RESET"
 echo
 
 info "Will NOT remove"
@@ -44,6 +45,19 @@ if [ -n "$(docker image ls -q "$IMAGE" 2>/dev/null)" ]; then
   ok "Image '$IMAGE' removed"
 else
   ok "Image '$IMAGE' was not present"
+fi
+echo
+
+# Derived sidecar images the launcher builds for a host uid other than 1000.
+# By repository:tag, not by image ID: removing an ID would also drop other tags the image may have.
+_derived="$(docker image ls copilot-pod-dind --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v ':<none>$' || true)"
+if [ -n "$_derived" ]; then
+  # shellcheck disable=SC2086
+  if docker rmi -f $_derived >/dev/null 2>&1; then
+    ok "Removed sidecar images"
+  else
+    err "Could not remove the sidecar images (copilot-pod-dind:*); a session may still use them."
+  fi
 fi
 echo
 

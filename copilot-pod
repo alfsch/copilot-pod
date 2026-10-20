@@ -169,17 +169,19 @@ DOCKER_FLAGS+=("--pids-limit=${PIDS:-4096}")
 #     per-run volume that only it and this pod mount, so other containers and local host users that
 #     can reach the sidecar's bridge IP can't use the daemon. The port is never published.
 #   - $PWD is mounted into the sidecar at the same path so `docker run -v "$PWD:..."` resolves. The
-#     sidecar user is uid 1000, so on hosts where your uid differs, inner containers may not be able
-#     to write to the project.
+#     sidecar user is uid 1000 and an inner container's root maps to it, so on Linux hosts where your uid
+#     differs, inner containers could not write to the project. There the launcher builds a small
+#     derived sidecar image whose user has your uid (see "Host uid" in docs/docker-sidecar.md).
 #   - Images, containers and volumes of the inner daemon vanish when the session ends, unless
 #     DOCKER_CACHE=1: then the daemon's data dir lives in a named volume (copilot-pod-docker-<SHA-256 of
 #     $PWD>, one per project) and image layers are reused across sessions. A named volume, not a host
 #     folder, because overlay storage doesn't work on macOS/Windows file shares and the dir must be
-#     owned by the sidecar's uid 1000. Only one session per project may use it at a time, since two
+#     owned by the sidecar's uid. Only one session per project may use it at a time, since two
 #     dockerd instances can't share a data dir (enforced by a fixed sidecar name). Trade-off: whatever a session pulled or built (including
 #     anything malicious or secret) is still there next time; uninstall.sh removes these volumes.
 #   - Ports published by inner containers live on the sidecar's network, not on the host.
 #   The sidecar image is pinned by digest (kept current by Renovate). Override it with DIND_IMAGE=...
+[ -n "${DIND_IMAGE:-}" ] && _dind_image_set=1 || _dind_image_set=
 DIND_IMAGE="${DIND_IMAGE:-docker:28-dind-rootless@sha256:7c3e797187e43738220462658f4586572cbd3bf009f728b21e34d9c5c06ce431}"
 # Automatic cleanup of old DOCKER_CACHE volumes. Docker doesn't record when a volume was last used, so
 # each cache gets an empty "stamp" file in STATE_DIR whose mtime is its last use: touched at session
@@ -203,7 +205,7 @@ prune_dind_caches() {
     if out="$(docker volume rm "$name" 2>&1)"; then
       rm -f "$stamp"
       printf '%s●%s Removed Docker cache %s (unused for over %s days)\n' "$BOLD" "$RESET" "$name" "$max_days" >&2
-    elif [[ "$out" == *"No such volume"* ]]; then
+    elif grep -qi 'no such volume' <<<"$out"; then
       rm -f "$stamp"   # already gone (deleted by hand)
     fi
   done < <(find "$STATE_DIR" -type f -mmin +$(( max_days * 1440 )) -print0 2>/dev/null)
@@ -252,6 +254,37 @@ if [ -n "${DOCKER:-}" ]; then
   # Signals during startup: bash runs these only after the command in flight has finished, so cleanup
   # never races a still-running `docker run -d`. They are replaced by stop_pod once the pod starts.
   trap 'exit 143' TERM; trap 'exit 130' INT; trap 'exit 129' HUP
+  # Linux host with a uid other than 1000 (not root, which rootless dockerd cannot use): renumber the
+  # image's `rootless` user to the host uid, so inner containers can write to the project. A user-set
+  # DIND_IMAGE is used as is. The tag contains the base digest, so a new pin gets a new derived image.
+  DIND_UID=; DIND_GID=
+  if [ -z "$_dind_image_set" ] && [ "$(uname -s)" = Linux ] && [ "$(id -u)" != 1000 ] && [ "$(id -u)" != 0 ]; then
+    DIND_UID="$(id -u)"; DIND_GID="$(id -g)"
+    # The subordinate id range for inner users stays at the image's 100000..165535 unless the host uid or gid
+    # lies in it: inner root would then map to the same outer id as a subordinate id, which Linux rejects, and
+    # the sidecar would not start. Then the next free block of 65536 ids at 200000, 300000, ... is used (two ids
+    # block at most two of them, and a fixed step cannot run past the 32-bit limit).
+    _sub=100000
+    while (( (DIND_UID >= _sub && DIND_UID < _sub + 65536) || (DIND_GID >= _sub && DIND_GID < _sub + 65536) )); do _sub=$(( _sub + 100000 )); done
+    _base="$DIND_IMAGE"; DIND_IMAGE="copilot-pod-dind:uid$DIND_UID-gid$DIND_GID-${_base##*:}"
+    if [ -z "$(docker image ls -q "$DIND_IMAGE" 2>/dev/null)" ]; then
+      printf '%s●%s Building Docker sidecar image for uid %s (first start only)...\n' "$BOLD" "$RESET" "$DIND_UID" >&2
+      docker build -q -t "$DIND_IMAGE" --build-arg "BASE=$_base" --build-arg "U=$DIND_UID" --build-arg "G=$DIND_GID" --build-arg "SUB=$_sub" - >/dev/null <<'EOF' \
+        || die "Could not build the Docker sidecar image for uid $DIND_UID."
+ARG BASE
+FROM $BASE
+ARG U
+ARG G
+ARG SUB
+USER root
+RUN sed -i "s/^rootless:x:1000:1000:/rootless:x:$U:$G:/" /etc/passwd \
+ && sed -i "s/^rootless:x:1000:/rootless:x:$G:/" /etc/group \
+ && echo "rootless:$SUB:65536" | tee /etc/subuid > /etc/subgid \
+ && chown -R $U:$G /home/rootless
+USER rootless
+EOF
+    fi
+  fi
   docker network create "$DIND_NET" >/dev/null || die "Could not create network for the Docker sidecar."
   docker volume create "$DIND_CERTS" >/dev/null || die "Could not create certificate volume for the Docker sidecar."
   DIND_DATA_FLAGS=()
@@ -259,7 +292,10 @@ if [ -n "${DOCKER:-}" ]; then
     # SHA-256 (cut to 16 hex chars) so distinct projects can't share a cache; sha256sum on Linux,
     # shasum on macOS.
     # pwd -P: the same project reached via a symlink must map to the same cache.
-    _hash="$(pwd -P | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16)"
+    # The sidecar's uid and gid are part of the hash: the volume is owned by them, and a sidecar with other ids
+    # (the derived image, or the stock image's 1000:1000) could not use it. DIND_UID and DIND_GID are set only
+    # for the derived image.
+    _hash="$({ pwd -P; echo "${DIND_UID:-1000}:${DIND_GID:-1000}"; } | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16)"
     [[ "$_hash" =~ ^[0-9a-f]{16}$ ]] || die "Could not hash the project path (need sha256sum or shasum)."
     DIND_CACHE_VOL="copilot-pod-docker-$_hash"
     # A fixed sidecar name is the exclusive reservation: Docker refuses a second container with the
@@ -272,8 +308,11 @@ if [ -n "${DOCKER:-}" ]; then
     DIND_DATA_FLAGS=(-v "$DIND_CACHE_VOL:/home/rootless/.local/share/docker")
   fi
   # No --rm: a sidecar that dies during startup must still exist so its logs can be shown below;
-  # cleanup_dind removes it.
-  docker run -d --privileged \
+  # cleanup_dind removes it. --init: the image's entrypoint is a shell that runs as PID 1 and generates the
+  # TLS certificates before it execs dockerd; a PID 1 without a handler ignores SIGTERM, so an abort during
+  # startup would wait out the whole 10s stop timeout (exit 137). With tini as PID 1 the shell stops at once;
+  # after the exec, dockerd gets the signal and shuts down gracefully as before.
+  docker run -d --privileged --init \
     --name "$DIND_NAME" --label "copilot-pod.run=$RUN_ID" --network "$DIND_NET" --network-alias dind \
     --pids-limit="${PIDS:-4096}" \
     ${MEMORY:+--memory="$MEMORY"} ${CPUS:+--cpus="$CPUS"} \
@@ -333,9 +372,19 @@ fi
 # COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN are forwarded only when set on the host (bare -e),
 # for token-based login instead of the interactive /login. They take precedence over stored
 # credentials, and they also authenticate `gh` inside the container.
+#
+# Interactive Bash (the default command) ignores SIGTERM even under --init, so `docker stop` would wait
+# out the 10s grace period and end in exit 137. SIGHUP makes it exit at once (status 129). Only the
+# default shell (no command, or a plain `bash`) gets it: other commands, including `bash -c ...`, keep the
+# image's stop signal (SIGTERM).
+STOP_FLAGS=()
+if [ -n "${DOCKER:-}" ] && { [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ "$1" = bash ]; }; }; then
+  STOP_FLAGS=(--stop-signal=SIGHUP)
+fi
 RUN_CMD=(docker run "${DOCKER_FLAGS[@]}" \
   ${DOCKER:+--name "$POD_NAME"} \
   ${DOCKER:+--init} \
+  ${STOP_FLAGS[@]+"${STOP_FLAGS[@]}"} \
   --cap-drop=ALL \
   --security-opt=no-new-privileges \
   --user "$(id -u):$(id -g)" \
@@ -361,12 +410,31 @@ RUN_CMD=(docker run "${DOCKER_FLAGS[@]}" \
 if [ -z "${DOCKER:-}" ]; then
   exec "${RUN_CMD[@]}"
 fi
-POD_PID=
-stop_pod() { docker stop -t 10 "$POD_NAME" >/dev/null 2>&1 || kill "$POD_PID" 2>/dev/null || true; }
+POD_PID=; STOP_REQUESTED=; POD_SEEN=; POD_GONE=; POD_KILLED=
+# A stop request is remembered and re-applied by the loop below until the pod is gone: before POD_PID is
+# known there is nothing to stop yet, and `docker stop` on a created-but-not-started container succeeds
+# without effect, after which the pod would start anyway. Once the container has been stopped (and removed
+# by --rm) its client may still be writing the pod's output: it is then left alone, because signalling it
+# again cuts that output and, from the third signal on, makes it exit 1 instead of with the pod's status.
+# The same holds if the pod ended by itself before the first stop request (never seen by a successful stop):
+# the client is signalled at most once, which is enough for a container that does not exist yet.
+stop_pod() {
+  STOP_REQUESTED=1
+  [ -z "$POD_GONE" ] || return 0
+  if _out="$(docker stop -t 10 "$POD_NAME" 2>&1)"; then POD_SEEN=1
+  elif ! grep -qi 'no such container' <<<"$_out"; then :   # any other error (daemon busy, ...) is retried, not taken as "gone"
+  elif [ -n "$POD_SEEN" ]; then POD_GONE=1
+  elif [ -n "$POD_PID" ] && [ -z "$POD_KILLED" ]; then POD_KILLED=1; kill "$POD_PID" 2>/dev/null   # no container yet: end the client
+  fi
+  return 0
+}
 trap stop_pod TERM INT HUP
 set +e
 "${RUN_CMD[@]}" <&0 &
 POD_PID=$!
-while kill -0 "$POD_PID" 2>/dev/null; do sleep 0.2; done
+while kill -0 "$POD_PID" 2>/dev/null; do
+  [ -z "$STOP_REQUESTED" ] || stop_pod
+  sleep 0.2
+done
 wait "$POD_PID"
 exit $?
