@@ -154,7 +154,7 @@ order() {    # order <regex>... : first match of each appears in this order
     n="$(grep -nE -- "$re" "$STUB_LOG" | head -n1 | cut -d: -f1)"; [ -n "$n" ] || fail "missing docker call: $re"
     [ "$n" -gt "$last" ] || fail "docker call out of order: $re"; last=$n; done
 }
-wait_for() { local i; for i in $(seq 1 100); do [ -e "$1" ] && return 0; sleep 0.1; done; fail "timed out waiting for $1"; }
+wait_for() { local _; for _ in $(seq 1 100); do [ -e "$1" ] && return 0; sleep 0.1; done; fail "timed out waiting for $1"; }
 
 # ---- tests ---------------------------------------------------------------------------------------------
 test_plain_exec() {   # without DOCKER=1 the launcher only execs docker run (invariant 7)
@@ -285,7 +285,7 @@ test_term_startup() {   # SIGTERM while the sidecar is starting: 143 and everyth
 test_double_term_startup() {   # a second SIGTERM during cleanup must not cut it short
   setup_case; launch_bg DOCKER=1 STUB_READY_AFTER=1000 STUB_NETRM_SLEEP=3 -- true
   wait_for "$STUB_DIR/sidecar"; sleep 1; kill -TERM "$LPID"
-  wait_for_log() { local i; for i in $(seq 1 100); do grep -q '^network rm' "$STUB_LOG" && return 0; sleep 0.1; done; fail "cleanup never started"; }
+  wait_for_log() { local _; for _ in $(seq 1 100); do grep -q '^network rm' "$STUB_LOG" && return 0; sleep 0.1; done; fail "cleanup never started"; }
   wait_for_log; sleep 0.5; kill -TERM "$LPID" 2>/dev/null; finish_bg
   logged '^volume rm copilot-pod-certs-'
 }
@@ -410,7 +410,11 @@ run_mutants() {
 if [ "${1:-}" = --inner ]; then "$2"; exit $?; fi
 # No mapfile (not in Bash 3.2) and no silent empty run: an empty list would skip the baseline and let every
 # mutant count as killed.
-tests=("$@"); [ ${#tests[@]} -gt 0 ] || tests=($(declare -F | awk '$3 ~ /^test_/ {print $3}'))
+tests=("$@")
+if [ ${#tests[@]} -eq 0 ]; then
+  # shellcheck disable=SC2207  # the words are test names, and mapfile is what must be avoided
+  tests=($(declare -F | awk '$3 ~ /^test_/ {print $3}'))
+fi
 [ ${#tests[@]} -gt 0 ] || { echo "  ERROR     no tests found" >&2; exit 1; }
 failed=0
 for t in "${tests[@]}"; do
