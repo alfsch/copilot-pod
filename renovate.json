@@ -41,8 +41,9 @@
       "pinDigests": true
     },
     {
-      "description": "Merge GitHub Actions updates once the required stub-tests check passes; main only accepts squash merges",
+      "description": "Merge GitHub Actions updates once the required stub-tests check passes, but not before a release is 3 days old; main only accepts squash merges",
       "matchManagers": ["github-actions"],
+      "minimumReleaseAge": "3 days",
       "automerge": true,
       "automergeType": "pr",
       "automergeStrategy": "squash"
