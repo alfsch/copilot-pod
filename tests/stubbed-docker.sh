@@ -209,6 +209,9 @@ test_host_uid_cache() {   # the cache volume of the derived image is separate fr
   local h; h="$(cd "$PROJ" && { pwd -P; echo 1001; } | sha256sum | cut -c1-16)"
   rc_is 0; in_out "created new copilot-pod-docker-$h"; logged "^run -d .*--name copilot-pod-dind-cache-$h "
   [ "$h" != "$HASH" ] || fail "uid not part of the hash"
+  # a user-set DIND_IMAGE keeps the stock image (uid 1000): same cache as on a uid 1000 host, not the derived one
+  setup_case; launch DOCKER=1 DOCKER_CACHE=1 STUB_UID=1001 DIND_IMAGE=my/dind:1 -- true
+  rc_is 0; in_out "created new copilot-pod-docker-$HASH"
 }
 test_prune() {   # old stamps pruned; young, in-use and foreign files kept; gone volumes lose only the stamp
   setup_case; mkdir -p "$STATE"
@@ -320,7 +323,8 @@ run_mutants() {
   mutate test_host_uid_skipped '[ -z "$_dind_image_set" ] && ' '' || rc=1
   mutate test_host_uid_skipped '[ "$(uname -s)" = Linux ] && ' '' || rc=1
   mutate test_host_uid      'if [ -z "$(docker image ls -q "$DIND_IMAGE" 2>/dev/null)" ]; then' 'if true; then' || rc=1
-  mutate test_host_uid_cache '{ pwd -P; id -u; }' '{ pwd -P; echo 1000; }' || rc=1
+  mutate test_host_uid_cache '{ pwd -P; echo "${DIND_UID:-1000}"; }' '{ pwd -P; id -u; }' || rc=1
+  mutate test_host_uid_cache '{ pwd -P; echo "${DIND_UID:-1000}"; }' '{ pwd -P; echo 1000; }' || rc=1
   mutate test_prune         '-mmin +$(( max_days * 1440 ))' '-mmin +0' || rc=1
   mutate test_prune         'elif grep -qi '"'"'no such volume'"'"' <<<"$out"; then' 'elif false; then' || rc=1
   mutate test_double_term_startup $'  trap \'\' INT TERM HUP\n' '' || rc=1

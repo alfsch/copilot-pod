@@ -213,7 +213,7 @@ Add `DOCKER_CACHE=1` to keep the sidecar's images, layers and volumes between se
 DOCKER=1 DOCKER_CACHE=1 copilot-pod
 ```
 
-- The data lives in a Docker named volume `copilot-pod-docker-<SHA-256 of the project path and your uid, first 16 hex characters>`, one per project and user. It is not a host folder: overlay storage doesn't work on macOS/Windows file shares, and the directory has to be owned by the sidecar's uid.
+- The data lives in a Docker named volume `copilot-pod-docker-<SHA-256 of the project path and the sidecar's uid, first 16 hex characters>`, one per project. It is not a host folder: overlay storage doesn't work on macOS/Windows file shares, and the directory has to be owned by the sidecar's uid.
 - On startup you'll see either `Docker cache: created new ...` or `Docker cache: reusing ... (N images, SIZE)`, so you can tell at a glance whether the cache is working.
 - Only one session per project can use the cache at a time; a second one stops with a message. Run it without `DOCKER_CACHE=1` for a throwaway daemon alongside.
 - **Security trade-off:** whatever a session pulled or built, including anything malicious or secret, is still there in the next one. Skip it for untrusted code.
