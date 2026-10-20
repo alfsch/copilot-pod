@@ -7,6 +7,8 @@
 # Needs: Docker, the image `copilot-pod` (./install.sh builds it) and, for the rootless sidecar, unprivileged
 # user namespaces (on Ubuntu 24.04+: kernel.apparmor_restrict_unprivileged_userns=0). Network access to pull the
 # inner test image (ITEST_INNER_IMAGES, tried in order). Only exit codes and results are asserted, never timings.
+# The leak check compares resource names before and after, so it assumes that no other copilot-pod session starts on
+# the same daemon while the tests run (sessions that end do not matter).
 # The project folder must be visible to the Docker daemon: set ITEST_TMPDIR (default $TMPDIR or /tmp) to a
 # directory the daemon can see if it runs in another mount namespace or a VM.
 # Usage: tests/integration.sh        Exit status 1 if any check failed.
@@ -50,7 +52,9 @@ HOST_UID="$(id -u)"; HOST_GID="$(id -g)"
 if [ "$(uname -s)" = Linux ] && [ "$HOST_UID" != 1000 ] && [ "$HOST_UID" != 0 ]; then SIDECAR_IDS="$HOST_UID:$HOST_GID"; else SIDECAR_IDS=1000:1000; fi
 CACHE_HASH="$(cd "$PROJ" && { pwd -P; echo "$SIDECAR_IDS"; } | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16)"
 CACHE_VOL="copilot-pod-docker-$CACHE_HASH"
-PRUNE_VOL="copilot-pod-docker-0123456789abcdef"
+# A cache volume of another project that the prune test lets expire; named after this run's directory (16 hex
+# characters, as the launcher requires), so that concurrent runs on one daemon cannot touch each other's.
+PRUNE_VOL="copilot-pod-docker-$(printf '%s' "$WORK" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16)"
 
 cleanup() {
   local p
