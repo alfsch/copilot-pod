@@ -69,10 +69,10 @@ start_launcher() {
      ${envs[@]+"${envs[@]}"} "$LAUNCHER" "$@") &
   LP=$!; BG_PIDS+=("$LP")
 }
-# A pod is up once its container runs.
-wait_for_pod() {
+# wait_running <container name>: wait until exactly that container runs (not just any copilot-pod session).
+wait_running() {
   local _; for _ in $(seq 1 240); do
-    [ "$(docker ps -q --filter name=copilot-pod-run- | grep -c .)" -gt 0 ] && return 0; sleep 0.5; done; return 1
+    [ -n "$(docker ps -q --filter "name=^$1\$")" ] && return 0; sleep 0.5; done; return 1
 }
 
 echo "host uid:gid $HOST_UID:$HOST_GID, docker $(docker version -f '{{.Server.Version}}' 2>/dev/null), inner images: ${INNER_IMAGES[*]}"
@@ -116,7 +116,9 @@ step inner-chown-to-another-uid inner_chown
 inner_build() { printf "FROM %s\nRUN echo built > /built\n" "$IMG" > Dockerfile && docker build -q -t itest-build . >/dev/null && [ "$(docker run --rm itest-build cat /built)" = built ]; }
 step inner-docker-build inner_build
 compose_up() { printf "services:\n  s:\n    image: %s\n    command: [\"echo\", \"compose-ok\"]\n" "$IMG" > compose.yaml
-  local out; out="$(docker compose up --abort-on-container-exit 2>&1)"; docker compose down >/dev/null 2>&1; grep -q compose-ok <<<"$out"; }
+  local out up down; out="$(docker compose up --abort-on-container-exit 2>&1)"; up=$?
+  docker compose down >/dev/null 2>&1; down=$?
+  [ "$up" = 0 ] && [ "$down" = 0 ] && grep -q compose-ok <<<"$out"; }
 step inner-docker-compose compose_up
 '
 SESSION_OUT="$WORK/session.out"
@@ -137,34 +139,44 @@ run_launcher DOCKER=1 -- sh -c 'exit 7' >"$WORK/exit.out" 2>&1; rc=$?
 if [ "$rc" = 7 ]; then ok "pod exit 7 -> launcher exit 7"; else fail "pod exit 7 -> launcher exit 7 (got $rc)"; tail -n 20 "$WORK/exit.out" | indent; fi
 
 section "cache (DOCKER_CACHE=1)"
-run_launcher DOCKER=1 DOCKER_CACHE=1 -- docker pull -q "${INNER_IMAGES[0]}" >"$WORK/cache1.out" 2>&1 \
-  || run_launcher DOCKER=1 DOCKER_CACHE=1 -- docker pull -q "${INNER_IMAGES[1]:-${INNER_IMAGES[0]}}" >>"$WORK/cache1.out" 2>&1
+CACHE_IMG=
+for ref in "${INNER_IMAGES[@]}"; do
+  if run_launcher DOCKER=1 DOCKER_CACHE=1 -- docker pull -q "$ref" >>"$WORK/cache1.out" 2>&1; then CACHE_IMG="$ref"; break; fi
+done
+check "first session pulled an inner image into the cache" test -n "$CACHE_IMG"
 check "first session creates the cache volume $CACHE_VOL" grep -q "created new $CACHE_VOL" "$WORK/cache1.out"
 check "cache volume exists" docker volume inspect "$CACHE_VOL"
-run_launcher DOCKER=1 DOCKER_CACHE=1 -- docker images >"$WORK/cache2.out" 2>&1
+run_launcher DOCKER=1 DOCKER_CACHE=1 -- docker image inspect "${CACHE_IMG:-none}" >"$WORK/cache2.out" 2>&1; rc=$?
 check "second session reuses the cache" grep -q "reusing $CACHE_VOL" "$WORK/cache2.out"
-check "the pulled image is still there" grep -q alpine "$WORK/cache2.out"
+if [ -n "$CACHE_IMG" ] && [ "$rc" = 0 ]; then ok "the pulled image is still in the cache"; else fail "the pulled image is still in the cache"; tail -n 10 "$WORK/cache2.out" | indent; fi
 
 section "a running cache session: exclusivity, TLS, SIGTERM"
 start_launcher DOCKER=1 DOCKER_CACHE=1 -- sleep 300 >"$WORK/long.out" 2>&1
-if wait_for_pod; then ok "cache session is up"; else fail "cache session is up"; tail -n 30 "$WORK/long.out" | indent; fi
+# This project's cache sidecar has a fixed name; its run label names the pod of the same session.
+SIDE="copilot-pod-dind-cache-$CACHE_HASH"; POD=
+if wait_running "$SIDE"; then
+  POD="copilot-pod-run-$(docker inspect -f '{{index .Config.Labels "copilot-pod.run"}}' "$SIDE")"
+fi
+if [ -n "$POD" ] && wait_running "$POD"; then ok "cache session is up"; else fail "cache session is up"; tail -n 30 "$WORK/long.out" | indent; fi
 run_launcher DOCKER=1 DOCKER_CACHE=1 -- true >"$WORK/conflict.out" 2>&1; rc=$?
 if [ "$rc" != 0 ] && grep -q "docker rm -f copilot-pod-dind-cache-$CACHE_HASH" "$WORK/conflict.out"; then
   ok "a second session on the same cache is rejected with the leftover hint"
 else fail "a second session on the same cache is rejected with the leftover hint (rc $rc)"; tail -n 10 "$WORK/conflict.out" | indent; fi
-check "the first session is unaffected" test -n "$(docker ps -q --filter name=copilot-pod-run-)"
+check "the first session is unaffected" test -n "$(docker ps -q --filter "name=^${POD:-none}\$")"
 
-SIDECAR="$(docker ps -q --filter "name=copilot-pod-dind-cache-$CACHE_HASH" | head -n1)"
-if [ -n "$SIDECAR" ]; then
-  NET="$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$SIDECAR")"
-  CERTS="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/certs"}}{{.Name}}{{end}}{{end}}' "$SIDECAR")"
+if [ -n "$(docker ps -q --filter "name=^$SIDE\$")" ]; then
+  NET="$(docker inspect -f '{{range $k, $v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$SIDE")"
+  CERTS="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/certs"}}{{.Name}}{{end}}{{end}}' "$SIDE")"
   tls() { docker run --rm --network "$NET" -v "$CERTS:/certs:ro" --entrypoint sh copilot-pod -c "$1"; }
   tls_out="$(tls 'curl -s -m 5 http://dind:2376/_ping' 2>&1)"
   check "plain HTTP on 2376 is refused (HTTPS server)" grep -q 'HTTP request to an HTTPS server' <<<"$tls_out"
-  if tls 'curl -s -m 5 http://dind:2375/_ping' >/dev/null 2>&1; then fail "port 2375 is closed"; else ok "port 2375 is closed"; fi
-  if tls 'curl -s -m 5 --cacert /certs/client/ca.pem https://dind:2376/_ping' >/dev/null 2>&1; then fail "TLS without a client certificate is refused"; else ok "TLS without a client certificate is refused"; fi
-  if tls 'cd /tmp && openssl req -x509 -newkey rsa:2048 -nodes -keyout k.pem -out c.pem -subj /CN=other -days 1 2>/dev/null && curl -s -m 5 --cacert /certs/client/ca.pem --cert c.pem --key k.pem https://dind:2376/_ping' >/dev/null 2>&1
-  then fail "a client certificate from another CA is refused"; else ok "a client certificate from another CA is refused"; fi
+  # Only the expected curl exit code counts as a refusal: 7 connection refused, 35/56 TLS handshake or alert. A
+  # setup failure (exit 99 below), DNS (6) or a timeout (28) must not pass for one.
+  refused() { local codes="$1" d="$2" rc; tls "$3" >/dev/null 2>&1; rc=$?
+    case " $codes " in *" $rc "*) ok "$d (curl exit $rc)" ;; *) fail "$d (exit $rc, expected one of: $codes)" ;; esac; }
+  refused "7" "port 2375 is closed" 'curl -s -m 5 http://dind:2375/_ping'
+  refused "35 56" "TLS without a client certificate is refused" 'curl -s -m 5 --cacert /certs/client/ca.pem https://dind:2376/_ping'
+  refused "35 56" "a client certificate from another CA is refused" 'cd /tmp && openssl req -x509 -newkey rsa:2048 -nodes -keyout k.pem -out c.pem -subj /CN=other -days 1 >/dev/null 2>&1 || exit 99; curl -s -m 5 --cacert /certs/client/ca.pem --cert c.pem --key k.pem https://dind:2376/_ping'
   ping_out="$(tls 'curl -s -m 5 --cacert /certs/client/ca.pem --cert /certs/client/cert.pem --key /certs/client/key.pem https://dind:2376/_ping' 2>&1)"
   check "the pod's own credentials are accepted" test "$ping_out" = OK
 else
