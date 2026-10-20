@@ -49,11 +49,15 @@ fi
 echo
 
 # Derived sidecar images the launcher builds for a host uid other than 1000.
-_derived="$(docker image ls -q copilot-pod-dind 2>/dev/null | sort -u || true)"
+# By repository:tag, not by image ID: removing an ID would also drop other tags the image may have.
+_derived="$(docker image ls copilot-pod-dind --format '{{.Repository}}:{{.Tag}}' 2>/dev/null | grep -v ':<none>$' || true)"
 if [ -n "$_derived" ]; then
   # shellcheck disable=SC2086
-  docker rmi -f $_derived >/dev/null 2>&1 || err "Could not remove the sidecar images (copilot-pod-dind:*); a session may still use them."
-  ok "Removed sidecar images"
+  if docker rmi -f $_derived >/dev/null 2>&1; then
+    ok "Removed sidecar images"
+  else
+    err "Could not remove the sidecar images (copilot-pod-dind:*); a session may still use them."
+  fi
 fi
 echo
 
