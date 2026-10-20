@@ -31,6 +31,7 @@ LAUNCHER="${LAUNCHER:-$ROOT/copilot-pod}"
 #   STUB_POD_DRAIN=N      the container is already gone when the client starts (the pod ended by itself, --rm) but
 #                         the client keeps writing for N seconds; like Docker's client it survives two signals
 #                         and exits 1 on the third (client-killed)
+#   STUB_STOP_ERROR_AT=N  the Nth `docker stop` of the pod fails with an error other than "No such container"
 #   STUB_DERIVED_EXISTS=1 the derived sidecar image already exists; STUB_BUILD_FAIL=1 `docker build` fails
 cat >"$BIN/docker" <<'STUB'
 #!/usr/bin/env bash
@@ -94,7 +95,9 @@ case "$1" in
   stop)
     # Stopping the pod ends the stub pod; its own exit code (143) is what the launcher must report.
     if [[ "$*" == *copilot-pod-run-* ]]; then
-      if [ -e "$STUB_DIR/pod-stopped" ]; then echo 'Error response from daemon: No such container' >&2; exit 1; fi
+      if [ -e "$STUB_DIR/pod-stopped" ]; then echo 'Error response from daemon: No such container: x' >&2; exit 1; fi
+      n="$(cat "$STUB_DIR/stops" 2>/dev/null || echo 0)"; echo $((n + 1)) > "$STUB_DIR/stops"
+      [ "$((n + 1))" != "${STUB_STOP_ERROR_AT:-0}" ] || { echo 'Error response from daemon: connection reset by peer' >&2; exit 1; }
       if [ ! -f "$STUB_DIR/pod.pid" ]; then
         [ -f "$STUB_DIR/pod-created" ] && exit 0   # created, not started: succeeds and does nothing
         echo 'Error response from daemon: No such container' >&2; exit 1
@@ -335,6 +338,12 @@ test_stop_after_natural_exit() {   # the pod ended by itself and its client is s
   [ "$(wc -l < "$STUB_DIR/client-signals")" -le 1 ] || fail "the client was signalled more than once"
   order '^stop -t 10 copilot-pod-run-' '^rm -f -v sidecarid' '^network rm'
 }
+test_stop_error_is_retried() {   # a stop that fails for another reason than "no such container" must not end the retries
+  setup_case; launch_bg DOCKER=1 STUB_POD_SLEEP=8 STUB_POD_CREATE_DELAY=3 STUB_STOP_ERROR_AT=2 -- sleep 8
+  wait_for "$STUB_DIR/pod-created"; kill -TERM "$LPID"; finish_bg
+  rc_is 143; [ "$(cat "$STUB_DIR/stops")" -ge 3 ] || fail "stop was not retried after the error"
+  order '^stop -t 10 copilot-pod-run-' '^rm -f -v sidecarid' '^network rm'
+}
 test_term_before_pod_pid() {   # a stop request in the gap before POD_PID is known must not be lost
   setup_case
   # The gap is microseconds wide, so inject the signal into a copy of the launcher right before the pod starts.
@@ -388,6 +397,7 @@ run_mutants() {
   mutate test_term_before_pod_pid $'  STOP_REQUESTED=1\n' '' || rc=1
   mutate test_stop_while_client_drains 'elif [ -n "$POD_SEEN" ]; then POD_GONE=1' 'elif false; then POD_GONE=1' || rc=1
   mutate test_stop_while_client_drains $'  [ -z "$POD_GONE" ] || return 0\n' '' || rc=1
+  mutate test_stop_error_is_retried "elif ! grep -qi 'no such container' <<<\"\$_out\"; then :" 'elif false; then :' || rc=1
   mutate test_stop_after_natural_exit '[ -n "$POD_PID" ] && [ -z "$POD_KILLED" ]; then POD_KILLED=1;' '[ -n "$POD_PID" ]; then' || rc=1
   mutate test_term_running  'trap stop_pod TERM INT HUP' 'trap "" TERM INT HUP' || rc=1
   mutate test_int_hup_running 'trap stop_pod TERM INT HUP' 'trap stop_pod TERM' || rc=1

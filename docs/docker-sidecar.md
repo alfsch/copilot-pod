@@ -49,7 +49,9 @@ host Docker  ──runs──▶  pod (copilot-pod image)         cap-drop=ALL, 
    pod ended by itself (so no stop ever succeeded, `POD_SEEN` stays empty) and the signal arrives while the
    client still writes: the kill fallback is therefore used at most once (`POD_KILLED`), which is enough for a
    container that does not exist yet (measured: pod printing 1 MB and exiting 0, TERM while the client was
-   stalled: exit 1 and 65536 bytes before, exit 0 and all bytes after).
+   stalled: exit 1 and 65536 bytes before, exit 0 and all bytes after). Only Docker's `No such container`
+   counts as "gone"; any other `docker stop` error (daemon busy, a dropped connection) is retried, otherwise a
+   hiccup between "created" and "started" would end the retries and the pod would start and keep running.
 6. The pod gets `--init` (only with `DOCKER=1`): with a bare shell or node as PID 1 the stop signal is
    ignored and the pod dies only after the 10s grace period (exit 137). `--init` is not enough for the
    default command: interactive Bash (TTY) ignores SIGTERM even as a child of tini (measured with

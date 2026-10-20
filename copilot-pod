@@ -421,7 +421,8 @@ POD_PID=; STOP_REQUESTED=; POD_SEEN=; POD_GONE=; POD_KILLED=
 stop_pod() {
   STOP_REQUESTED=1
   [ -z "$POD_GONE" ] || return 0
-  if docker stop -t 10 "$POD_NAME" >/dev/null 2>&1; then POD_SEEN=1
+  if _out="$(docker stop -t 10 "$POD_NAME" 2>&1)"; then POD_SEEN=1
+  elif ! grep -qi 'no such container' <<<"$_out"; then :   # any other error (daemon busy, ...) is retried, not taken as "gone"
   elif [ -n "$POD_SEEN" ]; then POD_GONE=1
   elif [ -n "$POD_PID" ] && [ -z "$POD_KILLED" ]; then POD_KILLED=1; kill "$POD_PID" 2>/dev/null   # no container yet: end the client
   fi
