@@ -39,6 +39,13 @@
       "matchDepNames": ["docker"],
       "matchDatasources": ["docker"],
       "pinDigests": true
+    },
+    {
+      "description": "Merge GitHub Actions updates once the required stub-tests check passes; main only accepts squash merges",
+      "matchManagers": ["github-actions"],
+      "automerge": true,
+      "automergeType": "pr",
+      "automergeStrategy": "squash"
     }
   ]
 }
