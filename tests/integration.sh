@@ -204,7 +204,9 @@ section "cache pruning (DOCKER_CACHE_MAX_AGE_DAYS)"
 check "volume for the prune test is created" docker volume create "$PRUNE_VOL"
 mkdir -p "$WORK/state/copilot-pod/caches"; touch -d '3 days ago' "$WORK/state/copilot-pod/caches/$PRUNE_VOL" 2>/dev/null \
   || touch -t "$(date -d '3 days ago' +%Y%m%d%H%M 2>/dev/null || date -v-3d +%Y%m%d%H%M)" "$WORK/state/copilot-pod/caches/$PRUNE_VOL"
-run_launcher DOCKER=1 DOCKER_CACHE=1 DOCKER_CACHE_MAX_AGE_DAYS=1 -- true >"$WORK/prune.out" 2>&1
+run_launcher DOCKER=1 DOCKER_CACHE=1 DOCKER_CACHE_MAX_AGE_DAYS=1 -- true >"$WORK/prune.out" 2>&1; rc=$?
+if [ "$rc" = 0 ]; then ok "the session that prunes starts and ends normally"
+else fail "the session that prunes starts and ends normally (exit $rc)"; tail -n 20 "$WORK/prune.out" | indent; fi
 check "a cache unused for longer than the limit is removed" bash -c '! docker volume inspect "$0"' "$PRUNE_VOL"
 check "the current project's cache is kept" docker volume inspect "$CACHE_VOL"
 
