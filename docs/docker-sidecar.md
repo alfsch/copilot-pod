@@ -85,9 +85,28 @@ Deliberately not done:
 - A warning when removing the sidecar fails (optional; the "cache in use" message already names the
   leftover).
 - Dropping `--privileged` for a minimal capability set (could not be tested).
+- Mapping the sidecar user to the host uid (see "Known limitation: host uid other than 1000").
 
 A launcher backgrounded by a non-interactive shell (script, CI) inherits SIGINT as ignored and Bash cannot
 override that; such launches must be cancelled with SIGTERM (documented in the README).
+
+## Known limitation: host uid other than 1000
+
+The sidecar's dockerd runs as uid 1000 (the image's `rootless` user) and the project folder is bind-mounted
+into it. An inner container's root maps to that uid, and `--user N` maps to a subordinate uid, so on a host
+where the project folder belongs to another uid neither can write to it. Measured on a real daemon with
+host uid 1001 and a folder owned by 1001 (mode 775):
+
+- the pod itself (`--user 1001:1001`) can write; the file is owned by 1001;
+- `docker run -v "$PWD:$PWD" alpine touch f` inside the pod: `Permission denied`, as root and with
+  `--user 1001:1001`;
+- with the folder mode 777 the root case works, and the file is then owned by uid 1000 on the host.
+
+Workarounds for users: `chmod o+w` the folder, or chown the files created by inner containers afterwards (that needs `sudo` on the host).
+A real fix (mapping the sidecar user to the host uid) is a design change and is not part of this feature. To
+check it on a host: run the three commands above from a project folder that is not under `/tmp`: a daemon that
+runs in a VM or another mount namespace may not see that path, and then even the pod gets `Permission denied`
+on an empty root-owned directory, which looks the same but is a test setup problem.
 
 ## Host requirement on Ubuntu 24.04+
 
