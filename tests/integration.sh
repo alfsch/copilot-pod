@@ -38,14 +38,17 @@ PROJ="$WORK/project"; mkdir -p "$PROJ" "$WORK/home" "$WORK/state"
 BG_PIDS=()
 # The names of the resources a session creates, now and after the tests: whatever exists afterwards and did not
 # before is what the tests left behind. Sessions of other users of this daemon, starting or ending, do not matter.
+# Fails when any listing fails: an empty list from a broken Docker must not look like "nothing left".
 snapshot() {
-  { docker ps -a --filter label=copilot-pod.run --format 'sidecar {{.Names}}'
-    docker ps -a --filter name=copilot-pod-run- --format 'pod {{.Names}}'
-    docker network ls --filter name=copilot-pod-net- --format 'network {{.Name}}'
-    docker volume ls --filter name=copilot-pod-certs- --format 'volume {{.Name}}'; } 2>/dev/null | sort
+  local a b c d
+  a="$(docker ps -a --filter label=copilot-pod.run --format 'sidecar {{.Names}}' 2>/dev/null)" || return 1
+  b="$(docker ps -a --filter name=copilot-pod-run- --format 'pod {{.Names}}' 2>/dev/null)" || return 1
+  c="$(docker network ls --filter name=copilot-pod-net- --format 'network {{.Name}}' 2>/dev/null)" || return 1
+  d="$(docker volume ls --filter name=copilot-pod-certs- --format 'volume {{.Name}}' 2>/dev/null)" || return 1
+  printf '%s\n%s\n%s\n%s\n' "$a" "$b" "$c" "$d" | sed '/^$/d' | sort
 }
-PRE_SNAPSHOT="$(snapshot)"
-leaked() { comm -13 <(printf '%s\n' "$PRE_SNAPSHOT") <(snapshot); }
+PRE_SNAPSHOT="$(snapshot)" || { echo "cannot list the Docker resources of copilot-pod" >&2; exit 2; }
+leaks_of() { comm -13 <(printf '%s\n' "$PRE_SNAPSHOT") <(printf '%s\n' "$1"); }
 
 # The cache volume name is sha256 of the project path and the sidecar's uid:gid (see the launcher): 1000:1000 for
 # the stock image, the host ids for the derived image used on Linux hosts with other uids.
@@ -206,9 +209,13 @@ check "a cache unused for longer than the limit is removed" bash -c '! docker vo
 check "the current project's cache is kept" docker volume inspect "$CACHE_VOL"
 
 section "nothing left behind"
-for _ in $(seq 1 30); do [ -z "$(leaked)" ] && break; sleep 1; done
-LEAKS="$(leaked)"
-if [ -z "$LEAKS" ]; then ok "the tests left no container, network or certificate volume behind"
+LEAKS=; SNAP_OK=
+for _ in $(seq 1 30); do
+  if NOW="$(snapshot)"; then SNAP_OK=1; LEAKS="$(leaks_of "$NOW")"; [ -z "$LEAKS" ] && break; else SNAP_OK=; fi
+  sleep 1
+done
+if [ -z "$SNAP_OK" ]; then fail "cleanup could not be verified: listing the Docker resources failed"
+elif [ -z "$LEAKS" ]; then ok "the tests left no container, network or certificate volume behind"
 else fail "the tests left resources behind"; printf '%s\n' "$LEAKS" | indent; fi
 
 echo; echo "$PASS passed, $FAIL failed"
