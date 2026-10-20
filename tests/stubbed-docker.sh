@@ -25,6 +25,9 @@ LAUNCHER="${LAUNCHER:-$ROOT/copilot-pod}"
 #   STUB_NETRM_SLEEP=N    `network rm` takes N seconds (widens the cleanup window for signals)
 #   STUB_UID / STUB_GID   what `id -u` / `id -g` report (default 1000, so the real host uid never matters)
 #   STUB_UNAME=Darwin     what `uname -s` reports (default Linux)
+#   STUB_POD_LINGER=N     after `docker stop` the container is gone ("No such container") but the client
+#                         keeps running N more seconds, like a client still writing output; a second signal
+#                         to it is recorded in client-killed (the real client then exits 1 and cuts the output)
 #   STUB_DERIVED_EXISTS=1 the derived sidecar image already exists; STUB_BUILD_FAIL=1 `docker build` fails
 cat >"$BIN/docker" <<'STUB'
 #!/usr/bin/env bash
@@ -59,7 +62,13 @@ case "$1" in
     if [ -n "${STUB_POD_SLEEP:-}" ]; then
       : > "$STUB_DIR/pod-created"; sleep "${STUB_POD_CREATE_DELAY:-0}"
       sleep "$STUB_POD_SLEEP" & s=$!
-      trap 'kill $s 2>/dev/null; exit 143' TERM
+      term() {
+        if [ -e "$STUB_DIR/pod-stopped" ]; then : > "$STUB_DIR/client-killed"; exit 1; fi
+        kill $s 2>/dev/null
+        if [ -n "${STUB_POD_LINGER:-}" ]; then : > "$STUB_DIR/pod-stopped"; sleep "$STUB_POD_LINGER" & wait $!; fi
+        exit 143
+      }
+      trap term TERM
       echo $$ > "$STUB_DIR/pod.pid"
       echo started > "$STUB_DIR/pod-running"
       wait $s
@@ -76,6 +85,7 @@ case "$1" in
   stop)
     # Stopping the pod ends the stub pod; its own exit code (143) is what the launcher must report.
     if [[ "$*" == *copilot-pod-run-* ]]; then
+      if [ -e "$STUB_DIR/pod-stopped" ]; then echo 'Error response from daemon: No such container' >&2; exit 1; fi
       if [ ! -f "$STUB_DIR/pod.pid" ]; then
         [ -f "$STUB_DIR/pod-created" ] && exit 0   # created, not started: succeeds and does nothing
         echo 'Error response from daemon: No such container' >&2; exit 1
@@ -289,6 +299,13 @@ test_term_during_pod_creation() {   # a stop that hits the created-but-not-start
   wait_for "$STUB_DIR/pod-created"; kill -TERM "$LPID"; finish_bg
   rc_is 143; order '^stop -t 10 copilot-pod-run-' '^rm -f -v sidecarid' '^network rm'
 }
+test_stop_while_client_drains() {   # the container is gone but its client is still finishing: leave it alone
+  setup_case; launch_bg DOCKER=1 STUB_POD_SLEEP=60 STUB_POD_LINGER=3 -- sleep 60
+  wait_for "$STUB_DIR/pod-running"; kill -TERM "$LPID"; finish_bg
+  rc_is 143; [ ! -e "$STUB_DIR/client-killed" ] || fail "the client was signalled again while it was finishing its output"
+  [ "$(grep -c '^stop -t 10 copilot-pod-run-' "$STUB_LOG")" -le 2 ] || fail "stop was retried after the container was gone"
+  order '^stop -t 10 copilot-pod-run-' '^rm -f -v sidecarid' '^network rm'
+}
 test_term_before_pod_pid() {   # a stop request in the gap before POD_PID is known must not be lost
   setup_case
   # The gap is microseconds wide, so inject the signal into a copy of the launcher right before the pod starts.
@@ -333,7 +350,9 @@ run_mutants() {
   mutate test_stop_signal   '[ "$#" -eq 1 ] && [ "$1" = bash ]' '[ "$1" = bash ]' || rc=1
   mutate test_term_before_pod_pid $'  [ -z "$STOP_REQUESTED" ] || stop_pod\n' '' || rc=1
   mutate test_term_during_pod_creation $'  [ -z "$STOP_REQUESTED" ] || stop_pod\n' '' || rc=1
-  mutate test_term_before_pod_pid 'STOP_REQUESTED=1; docker stop' 'docker stop' || rc=1
+  mutate test_term_before_pod_pid $'  STOP_REQUESTED=1\n' '' || rc=1
+  mutate test_stop_while_client_drains 'elif [ -n "$POD_SEEN" ]; then POD_GONE=1' 'elif false; then POD_GONE=1' || rc=1
+  mutate test_stop_while_client_drains $'  [ -z "$POD_GONE" ] || return 0\n' '' || rc=1
   mutate test_term_running  'trap stop_pod TERM INT HUP' 'trap "" TERM INT HUP' || rc=1
   mutate test_int_hup_running 'trap stop_pod TERM INT HUP' 'trap stop_pod TERM' || rc=1
   mutate test_int_hup_startup "trap 'exit 130' INT" "trap 'exit 1' INT" || rc=1

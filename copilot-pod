@@ -401,11 +401,21 @@ RUN_CMD=(docker run "${DOCKER_FLAGS[@]}" \
 if [ -z "${DOCKER:-}" ]; then
   exec "${RUN_CMD[@]}"
 fi
-POD_PID=; STOP_REQUESTED=
+POD_PID=; STOP_REQUESTED=; POD_SEEN=; POD_GONE=
 # A stop request is remembered and re-applied by the loop below until the pod is gone: before POD_PID is
 # known there is nothing to stop yet, and `docker stop` on a created-but-not-started container succeeds
-# without effect, after which the pod would start anyway.
-stop_pod() { STOP_REQUESTED=1; docker stop -t 10 "$POD_NAME" >/dev/null 2>&1 || { [ -z "$POD_PID" ] || kill "$POD_PID" 2>/dev/null; } || true; }
+# without effect, after which the pod would start anyway. Once the container has been stopped (and removed
+# by --rm) its client may still be writing the pod's output: it is then left alone, because signalling it
+# again cuts that output and, from the third signal on, makes it exit 1 instead of with the pod's status.
+stop_pod() {
+  STOP_REQUESTED=1
+  [ -z "$POD_GONE" ] || return 0
+  if docker stop -t 10 "$POD_NAME" >/dev/null 2>&1; then POD_SEEN=1
+  elif [ -n "$POD_SEEN" ]; then POD_GONE=1
+  elif [ -n "$POD_PID" ]; then kill "$POD_PID" 2>/dev/null   # no container yet: end the client
+  fi
+  return 0
+}
 trap stop_pod TERM INT HUP
 set +e
 "${RUN_CMD[@]}" <&0 &

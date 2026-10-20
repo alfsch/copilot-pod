@@ -40,7 +40,12 @@ host Docker  ──runs──▶  pod (copilot-pod image)         cap-drop=ALL, 
    repeats `docker stop` until the pod is gone. Two windows need that: before `POD_PID` is known, and
    between Docker creating the pod container and starting it, where `docker stop` succeeds without
    effect (measured: rc 0, state stays `created`, the waiting `docker run` then starts it anyway; 15/15
-   stops lost without the retry, 0/15 with it).
+   stops lost without the retry, 0/15 with it). Once a stop has succeeded and a later one finds no container
+   (`POD_SEEN`, then `POD_GONE`), the retries end and the client is left alone: the container is gone (`--rm`)
+   but the client may still be writing the pod's output, and signalling it again cut that output and, from
+   the third signal on, made it exit 1 instead of with the pod's status (measured: pod printing 1 MB on
+   SIGTERM into a stalled reader, exit 7 expected: exit 1 and 65536 of 1000000 bytes before, exit 7 and all
+   bytes after; Docker's client says `got 3 SIGTERM/SIGINTs, forcefully exiting`).
 6. The pod gets `--init` (only with `DOCKER=1`): with a bare shell or node as PID 1 the stop signal is
    ignored and the pod dies only after the 10s grace period (exit 137). `--init` is not enough for the
    default command: interactive Bash (TTY) ignores SIGTERM even as a child of tini (measured with
