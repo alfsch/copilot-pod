@@ -300,6 +300,7 @@ test_term_before_pod_pid() {   # a stop request in the gap before POD_PID is kno
 # ---- mutants: each must make its test fail, proving the test discriminates -----------------------------
 mutate() {   # mutate <test> <old> <new>   (literal replacement in a copy of the launcher)
   local test="$1" old="$2" new="$3" src; src="$(cat "$ROOT/copilot-pod"; echo x)"; src="${src%x}"
+  declare -F "$test" >/dev/null || { echo "  ERROR  mutant names an unknown test: $test"; return 1; }
   [[ "$src" == *"$old"* ]] || { echo "  ERROR  mutant for $test does not apply: $old"; return 1; }
   printf '%s' "${src/"$old"/$new}" > "$T/mutant"; chmod +x "$T/mutant"
   if ( LAUNCHER="$T/mutant" "$0" --inner "$test" >/dev/null 2>&1 ); then
@@ -338,7 +339,10 @@ run_mutants() {
 
 # ---- main ----------------------------------------------------------------------------------------------
 if [ "${1:-}" = --inner ]; then "$2"; exit $?; fi
-tests=("$@"); [ ${#tests[@]} -gt 0 ] || mapfile -t tests < <(declare -F | awk '$3 ~ /^test_/ {print $3}')
+# No mapfile (not in Bash 3.2) and no silent empty run: an empty list would skip the baseline and let every
+# mutant count as killed.
+tests=("$@"); [ ${#tests[@]} -gt 0 ] || tests=($(declare -F | awk '$3 ~ /^test_/ {print $3}'))
+[ ${#tests[@]} -gt 0 ] || { echo "  ERROR     no tests found" >&2; exit 1; }
 failed=0
 for t in "${tests[@]}"; do
   if ( "$t" ); then echo "  ok        $t"; else echo "  FAILED    $t"; failed=1; fi
