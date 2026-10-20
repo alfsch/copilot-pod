@@ -14,7 +14,7 @@ host Docker  ──runs──▶  pod (copilot-pod image)         cap-drop=ALL, 
                          └─ certs in a per-run volume, mounted read-only into the pod
 ```
 
-- Only the sidecar is privileged; its dockerd runs as uid 1000 in a user namespace. The host Docker
+- Only the sidecar is privileged; its dockerd runs as uid 1000 in a user namespace (the host uid on Linux, see "Host uid"). The host Docker
   socket is never mounted. The pod only has the `docker` CLI (plus Compose and Buildx) with `DOCKER_HOST`
   pointing at the sidecar.
 - `DOCKER_CACHE=1` additionally keeps the sidecar's data directory in a per-project named volume.
@@ -85,28 +85,42 @@ Deliberately not done:
 - A warning when removing the sidecar fails (optional; the "cache in use" message already names the
   leftover).
 - Dropping `--privileged` for a minimal capability set (could not be tested).
-- Mapping the sidecar user to the host uid (see "Known limitation: host uid other than 1000").
 
 A launcher backgrounded by a non-interactive shell (script, CI) inherits SIGINT as ignored and Bash cannot
 override that; such launches must be cancelled with SIGTERM (documented in the README).
 
-## Known limitation: host uid other than 1000
+## Host uid
 
 The sidecar's dockerd runs as uid 1000 (the image's `rootless` user) and the project folder is bind-mounted
 into it. An inner container's root maps to that uid, and `--user N` maps to a subordinate uid, so on a host
-where the project folder belongs to another uid neither can write to it. Measured on a real daemon with
-host uid 1001 and a folder owned by 1001 (mode 775):
+where the project folder belongs to another uid neither could write to it. Measured on a native Linux host
+with host uid 1001 and a folder owned by 1001 (mode 775): the pod itself could write, `docker run -v
+"$PWD:$PWD" alpine touch f` inside the pod failed with `Permission denied` (as root and with
+`--user 1001:1001`), and with the folder at mode 777 it worked but the file was owned by uid 1000.
 
-- the pod itself (`--user 1001:1001`) can write; the file is owned by 1001;
-- `docker run -v "$PWD:$PWD" alpine touch f` inside the pod: `Permission denied`, as root and with
-  `--user 1001:1001`;
-- with the folder mode 777 the root case works, and the file is then owned by uid 1000 on the host.
+So on Linux with a uid other than 1000 (and other than 0: rootless dockerd cannot run as root) the launcher
+builds a derived sidecar image, once per uid and base digest: `copilot-pod-dind:uid<uid>-gid<gid>-<digest>`,
+from the pinned base, built from a Dockerfile on stdin (no build context). It only renumbers the `rootless`
+user to the host uid and gid in `/etc/passwd` and `/etc/group` and chowns its home. Nothing else is needed:
+the entrypoint takes uid and paths from `id -u` and `$HOME`, and the subuid and subgid ranges are keyed by
+the user name, so they stay valid (inner containers still get a full range, so `chown 5000` works and shows
+up as a uid from that range on the host). Inner root then writes to the project as the host user.
 
-Workarounds for users: `chmod o+w` the folder, or chown the files created by inner containers afterwards (that needs `sudo` on the host).
-A real fix (mapping the sidecar user to the host uid) is a design change and is not part of this feature. To
-check it on a host: run the three commands above from a project folder that is not under `/tmp`: a daemon that
-runs in a VM or another mount namespace may not see that path, and then even the pod gets `Permission denied`
-on an empty root-owned directory, which looks the same but is a test setup problem.
+- A `DIND_IMAGE` set by the user is used as is, and so is a host with uid 1000 or 0 or a non-Linux `uname`
+  (macOS: Docker Desktop's file sharing handles ownership; not tested). WSL2 reports Linux and gets the
+  derived image; not tested either.
+- The cache volume is owned by the sidecar's uid, so a derived image cannot use a volume created by the stock
+  image. The uid is therefore part of the cache hash, but only when the derived image is used: existing
+  caches of uid 1000 hosts keep their names, and a cache of another uid made before this change is orphaned
+  (the 90-day prune or `uninstall.sh` removes it).
+- `uninstall.sh` removes the `copilot-pod-dind` images. A new base digest from Renovate builds a new derived
+  image on the next start; the old one stays until uninstall (a few MB of layers on top of the base).
+- Tests: the stub covers the decision (uid, root, `uname`, `DIND_IMAGE`), the build call and its failure and
+  the cache hash. That the renumbered image really works needs a daemon on a host with a uid other than 1000:
+  `DOCKER=1 copilot-pod sh -c 'docker run --rm -v "$PWD:$PWD" -w "$PWD" alpine:3 touch f'` from a project
+  folder under your home must succeed and leave `f` owned by you. Do not test from `/tmp`: a daemon in a VM
+  or another mount namespace may not see that path, and then even the pod gets `Permission denied` on an
+  empty root-owned directory, which looks the same but is a test setup problem.
 
 ## Host requirement on Ubuntu 24.04+
 

@@ -197,7 +197,7 @@ How it works: `copilot-pod` starts a separate **rootless Docker-in-Docker sideca
 Things to know:
 
 - The sidecar is privileged (inside Docker's VM on macOS/Windows). A kernel or runtime escape from it would be more serious than from the default pod, so use `DOCKER=1` only on projects you trust.
-- The project folder is mounted into the sidecar at the same path, so `docker run -v "$PWD:/app" ...` works. The sidecar's daemon runs as uid 1000, and an inner container's root maps to that uid. If your host uid is not 1000, inner containers **cannot write** to the project folder (`Permission denied`, also with `--user <your uid>`); the pod itself still can. Either make the folder writable for others (`chmod o+w`), or accept that files an inner container creates are owned by uid 1000 on the host (changing that back needs `sudo`).
+- The project folder is mounted into the sidecar at the same path, so `docker run -v "$PWD:/app" ...` works. On Linux with a host uid other than 1000, the launcher builds a small sidecar image once (a few seconds, `copilot-pod-dind:*`) whose user has your uid, so inner containers can write to the project as you. On macOS and WSL2 this is not tested; with a `DIND_IMAGE` of your own it is skipped.
 - Both Docker images (the CLI in the pod, the sidecar) are pinned by digest; `DIND_IMAGE` overrides the sidecar.
 - Ports published by inner containers (`docker run -p ...`) live on the sidecar's network, not on your host. `PORTS=...` only publishes ports of the pod itself, so it does not make an inner service reachable from the host. From inside the pod, reach it at `dind:<published-port>` (e.g. `curl http://dind:8080`); to open it from the host browser, run a small proxy in the pod that listens on a `PORTS` port and forwards to `dind:<port>`, or run the dev server in the pod instead. This is not a security boundary: on native Linux the sidecar's bridge network is routable from the host, so a port an inner container publishes on all interfaces can still be reached from the host via the sidecar's bridge IP. Bind such ports to `127.0.0.1` inside the sidecar (`-p 127.0.0.1:8080:80`) if that matters.
 - To cancel a `DOCKER=1` launcher that a script started in the background (`copilot-pod ... &`), send it SIGTERM (`kill $!`), not SIGINT: non-interactive shells start background jobs with SIGINT ignored, and Bash can't override that. Ctrl-C in a terminal and SIGINT from an interactive shell work. Either signal stops the pod first and then removes the sidecar, network and certificate volume.
@@ -213,7 +213,7 @@ Add `DOCKER_CACHE=1` to keep the sidecar's images, layers and volumes between se
 DOCKER=1 DOCKER_CACHE=1 copilot-pod
 ```
 
-- The data lives in a Docker named volume `copilot-pod-docker-<SHA-256 of the project path, first 16 hex characters>`, one per project. It is not a host folder: overlay storage doesn't work on macOS/Windows file shares, and the directory has to be owned by the sidecar's uid 1000.
+- The data lives in a Docker named volume `copilot-pod-docker-<SHA-256 of the project path, first 16 hex characters>`, one per project. It is not a host folder: overlay storage doesn't work on macOS/Windows file shares, and the directory has to be owned by the sidecar's uid.
 - On startup you'll see either `Docker cache: created new ...` or `Docker cache: reusing ... (N images, SIZE)`, so you can tell at a glance whether the cache is working.
 - Only one session per project can use the cache at a time; a second one stops with a message. Run it without `DOCKER_CACHE=1` for a throwaway daemon alongside.
 - **Security trade-off:** whatever a session pulled or built, including anything malicious or secret, is still there in the next one. Skip it for untrusted code.
@@ -319,7 +319,7 @@ PIDS=512 copilot-pod
 Everything this repo causes to exist outside the project you launch it from:
 
 - `~/.copilot-pod/` on your host — auth token, settings, and per-project session/conversation history (transcripts can include code snippets and command output Copilot saw). Auth and settings are shared across projects (one login, ever); session history lives under `~/.copilot-pod/session-state/`, and account/trust state in `~/.copilot-pod/.copilot.json`. This is *not* a host Copilot install; it's a state directory for the container's Copilot, kept on the host so it survives restarts.
-- Docker image `copilot-pod` and its layers, plus the `node:24-slim` base image, in Docker's image store. With `DOCKER_CACHE=1`, also one `copilot-pod-docker-*` volume per project. The last-use markers for pruning them are kept in `~/.local/state/copilot-pod/caches/` (the only host path outside `~/.copilot-pod/`, created only with `DOCKER_CACHE=1`).
+- Docker image `copilot-pod` and its layers, plus the `node:24-slim` base image, in Docker's image store. With `DOCKER_CACHE=1`, also one `copilot-pod-docker-*` volume per project; with `DOCKER=1` on a Linux host whose uid is not 1000, also a `copilot-pod-dind:*` image. The last-use markers for pruning them are kept in `~/.local/state/copilot-pod/caches/` (the only host path outside `~/.copilot-pod/`, created only with `DOCKER_CACHE=1`).
 - Docker build cache from `apt-get` and `npm install` steps.
 - Outbound network during build: Docker Hub, Debian apt mirrors, npm registry. During runtime: `the GitHub Copilot API` and whatever your project code reaches (network is unrestricted).
 - While a session is running: one container process, and any ports you explicitly mapped via `PORTS` bound on `127.0.0.1`.
@@ -346,7 +346,7 @@ If a platform doesn't behave as expected, please open an issue.
 ~/tools/copilot-pod/uninstall.sh
 ```
 
-Removes `~/.copilot-pod/` and the `copilot-pod` image after confirmation. Tells you exactly what it isn't touching (`node:24-slim`, build cache, this repo) and how to clean those up yourself.
+Removes `~/.copilot-pod/`, the `copilot-pod` image, any `DOCKER_CACHE` volumes and any `copilot-pod-dind` sidecar images after confirmation. Tells you exactly what it isn't touching (`node:24-slim`, build cache, this repo) and how to clean those up yourself.
 
 If you added a shell alias for convenience (e.g. `alias copilot-pod=...` in `~/.zshrc` / `~/.bashrc`), remove that line too — `uninstall.sh` doesn't touch your shell rc files.
 

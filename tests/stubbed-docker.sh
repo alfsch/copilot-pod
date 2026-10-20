@@ -23,12 +23,20 @@ LAUNCHER="${LAUNCHER:-$ROOT/copilot-pod}"
 #   STUB_RM_INUSE / STUB_RM_MISSING   space-separated volume names for which `volume rm` fails
 #                         with the real Docker 28 wording ("volume is in use" / "no such volume")
 #   STUB_NETRM_SLEEP=N    `network rm` takes N seconds (widens the cleanup window for signals)
+#   STUB_UID / STUB_GID   what `id -u` / `id -g` report (default 1000, so the real host uid never matters)
+#   STUB_UNAME=Darwin     what `uname -s` reports (default Linux)
+#   STUB_DERIVED_EXISTS=1 the derived sidecar image already exists; STUB_BUILD_FAIL=1 `docker build` fails
 cat >"$BIN/docker" <<'STUB'
 #!/usr/bin/env bash
 echo "$*" >> "$STUB_LOG"
 case "$1" in
   info) exit 0 ;;
-  image) [ "$2" = ls ] && echo abc123; exit 0 ;;
+  image)
+    if [[ "$*" == *copilot-pod-dind* ]]; then
+      { [ -n "${STUB_DERIVED_EXISTS:-}" ] || [ -e "$STUB_DIR/built" ]; } && echo derivedid; exit 0
+    fi
+    [ "$2" = ls ] && echo abc123; exit 0 ;;
+  build) cat > "$STUB_DIR/dockerfile"; : > "$STUB_DIR/built"; exit "${STUB_BUILD_FAIL:-0}" ;;
   network) [ "$2" = rm ] && sleep "${STUB_NETRM_SLEEP:-0}"; exit 0 ;;
   volume)
     case "$2" in
@@ -79,6 +87,15 @@ case "$1" in
 esac
 STUB
 chmod +x "$BIN/docker"
+cat >"$BIN/id" <<'STUB'
+#!/usr/bin/env bash
+case "${1:-}" in -u) echo "${STUB_UID:-1000}" ;; -g) echo "${STUB_GID:-1000}" ;; *) exec /usr/bin/id "$@" ;; esac
+STUB
+cat >"$BIN/uname" <<'STUB'
+#!/usr/bin/env bash
+case "${1:-}" in -s) echo "${STUB_UNAME:-Linux}" ;; *) exec /usr/bin/uname "$@" ;; esac
+STUB
+chmod +x "$BIN/id" "$BIN/uname"
 
 # ---- harness -------------------------------------------------------------------------------------------
 fail() { echo "    FAIL: $*" >&2; [ -f "$CASE/out" ] && sed 's/^/    out| /' "$CASE/out" >&2; [ -f "$CASE/err" ] && sed 's/^/    err| /' "$CASE/err" >&2; [ -f "$STUB_LOG" ] && sed 's/^/    log| /' "$STUB_LOG" >&2; exit 1; }
@@ -164,6 +181,34 @@ test_cache_conflict() {   # name already taken: refuse, point at the leftover, t
   rc_is 1; in_out "docker rm -f copilot-pod-dind-cache-$HASH"
   not_logged '^run --rm'; not_logged '^(stop|rm -f -v)'
   logged '^network rm '
+}
+test_host_uid() {   # Linux, uid other than 1000: derived sidecar image for that uid, built once, before the sidecar
+  setup_case; launch DOCKER=1 STUB_UID=1001 STUB_GID=1002 -- true
+  rc_is 0
+  logged '^build -q -t copilot-pod-dind:uid1001-gid1002-[0-9a-f]{64} --build-arg BASE=docker:28-dind-rootless@sha256:[0-9a-f]{64} --build-arg U=1001 --build-arg G=1002 -$'
+  logged '^run -d --privileged --init .* copilot-pod-dind:uid1001-gid1002-[0-9a-f]{64}$'
+  order '^build ' '^network create' '^run -d'
+  grep -q 'rootless:x:\$U:\$G:' "$STUB_DIR/dockerfile" || fail "Dockerfile does not renumber the rootless user"
+  in_out 'Building Docker sidecar image for uid 1001'
+  setup_case; launch DOCKER=1 STUB_UID=1001 STUB_GID=1002 STUB_DERIVED_EXISTS=1 -- true   # already built: reused
+  rc_is 0; not_logged '^build '; logged '^run -d .* copilot-pod-dind:uid1001-gid1002-'
+}
+test_host_uid_skipped() {   # stock image: uid 1000, root, a non-Linux host, a user-set DIND_IMAGE
+  local c; for c in "STUB_UID=1000" "STUB_UID=0" "STUB_UID=1001 STUB_UNAME=Darwin" "STUB_UID=1001 DIND_IMAGE=my/dind:1"; do
+    setup_case; launch DOCKER=1 $c -- true
+    rc_is 0; not_logged '^build '; not_logged 'copilot-pod-dind:'
+  done
+  logged '^run -d .* my/dind:1$'
+}
+test_host_uid_build_fails() {   # no sidecar without its image
+  setup_case; launch DOCKER=1 STUB_UID=1001 STUB_BUILD_FAIL=1 -- true
+  rc_is 1; in_out 'Could not build the Docker sidecar image for uid 1001'; not_logged '^run '
+}
+test_host_uid_cache() {   # the cache volume of the derived image is separate from the one owned by uid 1000
+  setup_case; launch DOCKER=1 DOCKER_CACHE=1 STUB_UID=1001 -- true
+  local h; h="$(cd "$PROJ" && { pwd -P; echo 1001; } | sha256sum | cut -c1-16)"
+  rc_is 0; in_out "created new copilot-pod-docker-$h"; logged "^run -d .*--name copilot-pod-dind-cache-$h "
+  [ "$h" != "$HASH" ] || fail "uid not part of the hash"
 }
 test_prune() {   # old stamps pruned; young, in-use and foreign files kept; gone volumes lose only the stamp
   setup_case; mkdir -p "$STATE"
@@ -269,6 +314,12 @@ run_mutants() {
   mutate test_sequence      $'  docker network rm "$DIND_NET" >/dev/null 2>&1 || true\n' '' || rc=1
   mutate test_option_validation 'die "$_v must be 1 (or unset), not '"'"'${!_v}'"'"'."' 'true' || rc=1
   mutate test_cache_new     'DIND_NAME="copilot-pod-dind-cache-$_hash"' 'DIND_NAME="copilot-pod-dind-$RUN_ID"' || rc=1
+  mutate test_host_uid_skipped '[ "$(id -u)" != 1000 ] && [ "$(id -u)" != 0 ]' '[ "$(id -u)" != 0 ]' || rc=1
+  mutate test_host_uid_skipped ' && [ "$(id -u)" != 0 ]; then' '; then' || rc=1
+  mutate test_host_uid_skipped '[ -z "$_dind_image_set" ] && ' '' || rc=1
+  mutate test_host_uid_skipped '[ "$(uname -s)" = Linux ] && ' '' || rc=1
+  mutate test_host_uid      'if [ -z "$(docker image ls -q "$DIND_IMAGE" 2>/dev/null)" ]; then' 'if true; then' || rc=1
+  mutate test_host_uid_cache '[ -z "$DIND_UID" ] || echo "$DIND_UID"' 'true' || rc=1
   mutate test_prune         '-mmin +$(( max_days * 1440 ))' '-mmin +0' || rc=1
   mutate test_prune         'elif grep -qi '"'"'no such volume'"'"' <<<"$out"; then' 'elif false; then' || rc=1
   mutate test_double_term_startup $'  trap \'\' INT TERM HUP\n' '' || rc=1
