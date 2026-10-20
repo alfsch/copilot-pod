@@ -34,11 +34,15 @@ BASE="${ITEST_TMPDIR:-${TMPDIR:-/tmp}}"; mkdir -p "$BASE"
 WORK="$(mktemp -d "$BASE/copilot-pod-itest.XXXXXX")" || exit 2
 PROJ="$WORK/project"; mkdir -p "$PROJ" "$WORK/home" "$WORK/state"
 BG_PIDS=()
-# What exists before the tests, to prove afterwards that nothing was left behind.
-count() { docker "$@" 2>/dev/null | grep -c .; }
-PRE_CONTAINERS="$(count ps -aq --filter label=copilot-pod.run)"
-PRE_NETWORKS="$(count network ls -q --filter name=copilot-pod-net-)"
-PRE_CERTS="$(count volume ls -q --filter name=copilot-pod-certs-)"
+# The names of the resources a session creates, now and after the tests: whatever exists afterwards and did not
+# before is what the tests left behind. Sessions of other users of this daemon, starting or ending, do not matter.
+snapshot() {
+  { docker ps -a --filter label=copilot-pod.run --format 'container {{.Names}}'
+    docker network ls --filter name=copilot-pod-net- --format 'network {{.Name}}'
+    docker volume ls --filter name=copilot-pod-certs- --format 'volume {{.Name}}'; } 2>/dev/null | sort
+}
+PRE_SNAPSHOT="$(snapshot)"
+leaked() { comm -13 <(printf '%s\n' "$PRE_SNAPSHOT") <(snapshot); }
 
 # The cache volume name is sha256 of the project path and the sidecar's uid:gid (see the launcher): 1000:1000 for
 # the stock image, the host ids for the derived image used on Linux hosts with other uids.
@@ -189,7 +193,7 @@ kill -TERM "$LP" 2>/dev/null; wait "$LP" 2>/dev/null; rc=$?
 if [ "$rc" = 143 ]; then ok "SIGTERM to the launcher -> exit 143"; else fail "SIGTERM to the launcher -> exit 143 (got $rc)"; tail -n 20 "$WORK/long.out" | indent; fi
 
 section "cache pruning (DOCKER_CACHE_MAX_AGE_DAYS)"
-docker volume create "$PRUNE_VOL" >/dev/null 2>&1
+check "volume for the prune test is created" docker volume create "$PRUNE_VOL"
 mkdir -p "$WORK/state/copilot-pod/caches"; touch -d '3 days ago' "$WORK/state/copilot-pod/caches/$PRUNE_VOL" 2>/dev/null \
   || touch -t "$(date -d '3 days ago' +%Y%m%d%H%M 2>/dev/null || date -v-3d +%Y%m%d%H%M)" "$WORK/state/copilot-pod/caches/$PRUNE_VOL"
 run_launcher DOCKER=1 DOCKER_CACHE=1 DOCKER_CACHE_MAX_AGE_DAYS=1 -- true >"$WORK/prune.out" 2>&1
@@ -197,12 +201,10 @@ check "a cache unused for longer than the limit is removed" bash -c '! docker vo
 check "the current project's cache is kept" docker volume inspect "$CACHE_VOL"
 
 section "nothing left behind"
-for _ in $(seq 1 30); do
-  [ "$(count ps -aq --filter label=copilot-pod.run)" = "$PRE_CONTAINERS" ] && break; sleep 1
-done
-check "no sidecar containers left" test "$(count ps -aq --filter label=copilot-pod.run)" = "$PRE_CONTAINERS"
-check "no networks left" test "$(count network ls -q --filter name=copilot-pod-net-)" = "$PRE_NETWORKS"
-check "no certificate volumes left" test "$(count volume ls -q --filter name=copilot-pod-certs-)" = "$PRE_CERTS"
+for _ in $(seq 1 30); do [ -z "$(leaked)" ] && break; sleep 1; done
+LEAKS="$(leaked)"
+if [ -z "$LEAKS" ]; then ok "the tests left no container, network or certificate volume behind"
+else fail "the tests left resources behind"; printf '%s\n' "$LEAKS" | indent; fi
 
 echo; echo "$PASS passed, $FAIL failed"
 [ "$FAIL" = 0 ]
