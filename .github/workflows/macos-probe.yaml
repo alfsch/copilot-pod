@@ -45,24 +45,30 @@ jobs:
           done
           exit "$rc"
 
-      # macOS has no timeout(1): a watchdog kills the run after 6 minutes, the output is kept in a file.
-      - name: Stub tests (system Bash 3.2 first in PATH, 6 minute watchdog)
+      # macOS has no timeout(1): each test gets a 40 second watchdog. No `set -e` here: a killed test must not end the step.
+      - name: Stub tests, one by one (system Bash 3.2 first in PATH)
         continue-on-error: true
         run: |
+          set +e
           export PATH=/bin:/usr/bin:$PATH
-          /bin/bash tests/stubbed-docker.sh > "$RUNNER_TEMP/stub.out" 2>&1 &
-          p=$!
-          ( sleep 360; kill "$p" 2>/dev/null ) &
-          w=$!
-          wait "$p"; rc=$?
-          kill "$w" 2>/dev/null
-          echo "stub tests exit: $rc (143 = killed by the watchdog)"
-          echo "--- ok count: $(grep -c '^  ok ' "$RUNNER_TEMP/stub.out")  FAILED: $(grep -c 'FAILED' "$RUNNER_TEMP/stub.out")"
-          echo "--- everything that is not ok:"; grep -v '^  ok ' "$RUNNER_TEMP/stub.out" | head -70
+          for t in $(grep -o '^test_[a-z_0-9]*' tests/stubbed-docker.sh); do
+            start=$(date +%s)
+            /bin/bash tests/stubbed-docker.sh "$t" > "$RUNNER_TEMP/t.out" 2>&1 &
+            p=$!
+            ( sleep 40; kill "$p" 2>/dev/null ) &
+            w=$!
+            wait "$p"; rc=$?
+            kill "$w" 2>/dev/null
+            if [ "$rc" = 0 ]; then r=ok; elif [ "$rc" = 143 ] || [ "$rc" = 137 ]; then r=HANG/SLOW; else r="FAIL($rc)"; fi
+            printf '%-36s %-10s %ss\n' "$t" "$r" "$(( $(date +%s) - start ))"
+            [ "$r" = ok ] || { grep -E 'FAIL:|not found|illegal|unbound|syntax' "$RUNNER_TEMP/t.out" | head -3 | sed 's/^/      /'; }
+          done
+          exit 0
 
       - name: Docker on this runner? (Colima via brew, time-boxed)
         continue-on-error: true
         run: |
+          set +e
           echo "--- docker before: $(command -v docker || echo none)"
           brew install colima docker 2>&1 | tail -2
           colima start --vm-type qemu --cpu 2 --memory 4 --disk 20 > "$RUNNER_TEMP/colima.out" 2>&1 &
@@ -72,6 +78,8 @@ jobs:
             sleep 10
           done
           kill "$p" 2>/dev/null
-          echo "--- colima start output (tail):"; tail -30 "$RUNNER_TEMP/colima.out"
-          echo "--- docker info:"; docker info 2>&1 | head -8 || true
-          colima list 2>&1 || true
+          echo "--- colima start output (tail):"; tail -40 "$RUNNER_TEMP/colima.out"
+          echo "--- docker info:"; docker info 2>&1 | head -8
+          colima list 2>&1
+          echo "--- lima logs"; ls ~/.colima/_lima/colima 2>/dev/null; tail -20 ~/.colima/_lima/colima/ha.stderr.log 2>/dev/null
+          exit 0
