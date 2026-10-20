@@ -31,7 +31,7 @@ jobs:
       - name: Syntax check
         run: |
           rc=0
-          for f in copilot-pod install.sh uninstall.sh tests/stubbed-docker.sh; do
+          for f in copilot-pod install.sh uninstall.sh tests/stubbed-docker.sh tests/integration.sh; do
             bash -n "$f" || rc=1
           done
           exit "$rc"
@@ -40,7 +40,7 @@ jobs:
       - name: ShellCheck
         run: >
           docker run --rm -v "$PWD:/mnt" -w /mnt koalaman/shellcheck:v0.10.0
-          -S warning copilot-pod install.sh uninstall.sh tests/stubbed-docker.sh
+          -S warning copilot-pod install.sh uninstall.sh tests/stubbed-docker.sh tests/integration.sh
 
       # Tests, then the mutants: each launcher with one fix removed must make a test fail.
       - name: Stub tests
