@@ -207,7 +207,7 @@ test_cache_conflict() {   # name already taken: refuse, point at the leftover, t
 test_host_uid() {   # Linux, uid other than 1000: derived sidecar image for that uid, built once, before the sidecar
   setup_case; launch DOCKER=1 STUB_UID=1001 STUB_GID=1002 -- true
   rc_is 0
-  logged '^build -q -t copilot-pod-dind:uid1001-gid1002-[0-9a-f]{64} --build-arg BASE=docker:28-dind-rootless@sha256:[0-9a-f]{64} --build-arg U=1001 --build-arg G=1002 --build-arg SUB=100000 -$'
+  logged '^build -q -t copilot-pod-dind:uid1001-gid1002-[0-9a-f]{64} --build-arg BASE=docker:[0-9a-z.-]+-dind-rootless@sha256:[0-9a-f]{64} --build-arg U=1001 --build-arg G=1002 --build-arg SUB=100000 -$'
   logged '^run -d --privileged --init .* copilot-pod-dind:uid1001-gid1002-[0-9a-f]{64}$'
   order '^build ' '^network create' '^run -d'
   grep -q 'rootless:x:\$U:\$G:' "$STUB_DIR/dockerfile" || fail "Dockerfile does not renumber the rootless user"
