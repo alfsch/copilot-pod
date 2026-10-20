@@ -9,7 +9,7 @@ change the feature: how it is built, why, and how to test it.
 
 ```
 host Docker  ──runs──▶  pod (copilot-pod image)         cap-drop=ALL, no-new-privileges, seccomp, --init
-             └─runs──▶  sidecar (docker:28-dind-rootless, --privileged)
+             └─runs──▶  sidecar (docker:<N>-dind-rootless, --privileged)
                          ▲  private per-run network, mTLS on 2376 (port never published)
                          └─ certs in a per-run volume, mounted read-only into the pod
 ```
