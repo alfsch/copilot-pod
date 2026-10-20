@@ -22,8 +22,8 @@ Runs the GitHub Copilot CLI in a hardened Docker container scoped to the current
   signals) has to be run on a host with Docker; the checklist is in `docs/docker-sidecar.md`.
 - Rootless DinD needs unprivileged user namespaces; on Ubuntu 24.04+ that means
   `kernel.apparmor_restrict_unprivileged_userns=0` for the test (set it back to `1` afterwards).
-- Run `bash -n copilot-pod uninstall.sh install.sh tests/stubbed-docker.sh` after every edit; CI also runs
-  ShellCheck (`-S warning`) on them.
+- After every edit run `for f in copilot-pod install.sh uninstall.sh tests/stubbed-docker.sh; do bash -n "$f"; done`
+  (`bash -n a b c` parses only `a`); CI does that and also runs ShellCheck (`-S warning`).
 
 ## Status
 
