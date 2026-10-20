@@ -163,7 +163,9 @@ section "Requirements for DOCKER=1" (sysctl.d setting and how to undo it). For t
 
 ## Testing
 
-There is no CI. Two layers have been used:
+The stub tests run in CI (`.github/workflows/stub-tests.yaml`: syntax check, ShellCheck and the suite, on pull
+requests and pushes to main); nothing in CI needs a Docker daemon, so the real-Docker checklist below stays manual.
+Two layers have been used:
 
 **Stubbed `docker`** (no daemon needed): `tests/stubbed-docker.sh` runs the cases below and then a set of
 mutants (the launcher with one fix removed) that each must make a test fail. Run it after every launcher
