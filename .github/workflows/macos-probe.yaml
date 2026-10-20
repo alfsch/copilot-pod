@@ -19,8 +19,6 @@ jobs:
         include:
           - os: macos-15-intel
             wait: 90   # x 10 s per attempt
-          - os: macos-latest
-            wait: 30
     runs-on: ${{ matrix.os }}
     timeout-minutes: 55
     steps:
@@ -34,7 +32,8 @@ jobs:
         run: |
           set +e
           sysctl kern.hv_support
-          brew install qemu colima docker 2>&1 | tail -3
+          brew install qemu colima docker docker-buildx 2>&1 | tail -3
+          mkdir -p ~/.docker/cli-plugins; ln -sfn "$(brew --prefix)/opt/docker-buildx/bin/docker-buildx" ~/.docker/cli-plugins/docker-buildx; docker buildx version
           try_start() {
             echo "=== colima start --vm-type $1"
             colima start --vm-type "$1" --cpu 2 --memory 4 --disk 20 --mount "$HOME:w" > "$RUNNER_TEMP/colima-$1.out" 2>&1 &
