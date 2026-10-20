@@ -27,6 +27,9 @@ command -v docker >/dev/null || { echo "docker is required" >&2; exit 2; }
 docker info >/dev/null 2>&1 || { echo "the Docker daemon is not running" >&2; exit 2; }
 [ -n "$(docker image ls -q copilot-pod 2>/dev/null)" ] || { echo "image 'copilot-pod' not found: run ./install.sh first" >&2; exit 2; }
 
+# The launcher runs with a private HOME; keep the caller's Docker config (contexts, credentials) for it, so that
+# it talks to the same daemon as the checks above.
+DOCKER_CONFIG_DIR="${DOCKER_CONFIG:-$HOME/.docker}"
 BASE="${ITEST_TMPDIR:-${TMPDIR:-/tmp}}"; mkdir -p "$BASE"
 WORK="$(mktemp -d "$BASE/copilot-pod-itest.XXXXXX")" || exit 2
 PROJ="$WORK/project"; mkdir -p "$PROJ" "$WORK/home" "$WORK/state"
@@ -58,15 +61,15 @@ trap cleanup EXIT
 # run_launcher [VAR=value ...] -- args: the launcher in the project folder, with a private HOME and state dir.
 run_launcher() {
   local envs=(); while [ "$1" != -- ]; do envs+=("$1"); shift; done; shift
-  (cd "$PROJ" && exec env HOME="$WORK/home" XDG_STATE_HOME="$WORK/state" COPILOT_POD_NO_UPDATE=1 \
-     ${envs[@]+"${envs[@]}"} "$LAUNCHER" "$@")
+  (cd "$PROJ" && exec env HOME="$WORK/home" DOCKER_CONFIG="$DOCKER_CONFIG_DIR" XDG_STATE_HOME="$WORK/state" \
+     COPILOT_POD_NO_UPDATE=1 ${envs[@]+"${envs[@]}"} "$LAUNCHER" "$@")
 }
 # start_launcher [VAR=value ...] -- args: like run_launcher, in the background. LP is the launcher's own pid (the
 # subshell execs it), so a signal sent to LP reaches the launcher and not a wrapper around it.
 start_launcher() {
   local envs=(); while [ "$1" != -- ]; do envs+=("$1"); shift; done; shift
-  (cd "$PROJ" && exec env HOME="$WORK/home" XDG_STATE_HOME="$WORK/state" COPILOT_POD_NO_UPDATE=1 \
-     ${envs[@]+"${envs[@]}"} "$LAUNCHER" "$@") &
+  (cd "$PROJ" && exec env HOME="$WORK/home" DOCKER_CONFIG="$DOCKER_CONFIG_DIR" XDG_STATE_HOME="$WORK/state" \
+     COPILOT_POD_NO_UPDATE=1 ${envs[@]+"${envs[@]}"} "$LAUNCHER" "$@") &
   LP=$!; BG_PIDS+=("$LP")
 }
 # wait_running <container name>: wait until exactly that container runs (not just any copilot-pod session).
@@ -103,7 +106,7 @@ POD_SCRIPT='
 step() { local n="$1" out rc; shift; out="$("$@" 2>&1)"; rc=$?
   if [ "$rc" = 0 ]; then echo "STEP ok $n"; else echo "STEP FAIL $n"; printf "%s\n" "$out" | tail -n 12 | sed "s/^/    | /"; fi; }
 pick() { local r i; for r in "$@"; do for i in 1 2 3; do docker pull -q "$r" >/dev/null 2>&1 && { IMG="$r"; return 0; }; sleep 3; done; done; return 1; }
-info() { docker info 2>&1 | grep -qi rootless && docker info 2>&1 | grep -q "Server Version"; }
+info() { docker info >/dev/null 2>&1 && docker info -f "{{.SecurityOptions}}" | grep -q "name=rootless" && [ -n "$(docker info -f "{{.ServerVersion}}")" ]; }
 tls_env() { [ "$DOCKER_TLS_VERIFY" = 1 ] && [ "$DOCKER_HOST" = tcp://dind:2376 ]; }
 step docker-info-reports-rootless info
 step tls-env-points-at-the-sidecar tls_env
