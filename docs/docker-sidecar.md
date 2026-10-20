@@ -36,9 +36,23 @@ host Docker  ──runs──▶  pod (copilot-pod image)         cap-drop=ALL, 
 5. The pod runs in the background and the launcher polls `kill -0` before a single `wait`, so the
    pod's exit status is never confused with a signal-interrupted `wait` (128+N). Startup traps are
    `exit 143/130/129`; once the pod runs, the trap is `stop_pod` (`docker stop`, or kill the client if
-   the pod does not exist yet).
+   the pod does not exist yet). A stop request is remembered in `STOP_REQUESTED` and the poll loop
+   repeats `docker stop` until the pod is gone. Two windows need that: before `POD_PID` is known, and
+   between Docker creating the pod container and starting it, where `docker stop` succeeds without
+   effect (measured: rc 0, state stays `created`, the waiting `docker run` then starts it anyway; 15/15
+   stops lost without the retry, 0/15 with it).
 6. The pod gets `--init` (only with `DOCKER=1`): with a bare shell or node as PID 1 the stop signal is
-   ignored and the pod dies only after the 10s grace period (exit 137).
+   ignored and the pod dies only after the 10s grace period (exit 137). `--init` is not enough for the
+   default command: interactive Bash (TTY) ignores SIGTERM even as a child of tini (measured with
+   `docker stop -t 10`: SIGTERM takes 10s and ends in 137, SIGHUP takes under 1s and ends in 129). So when
+   no command is given, or it is a plain `bash`, the pod also gets `--stop-signal=SIGHUP` and reports 129;
+   other commands (including `bash -c ...`, which is not interactive) keep SIGTERM and report 143. Not in the Dockerfile (`STOPSIGNAL`) on purpose: that would change the signal
+   for `copilot` and every other command too.
+   The sidecar gets `--init` too, for the same reason at another time: its image entrypoint is a shell that
+   runs as PID 1 and generates the TLS certificates before it execs dockerd, and a PID 1 without a handler
+   ignores SIGTERM, so a signal during startup cost the whole 10s stop timeout (exit 137). Measured with
+   `docker stop -t 10` 0.5s after start: 10.3s without `--init`, 0.2s with; a stop of a ready sidecar is
+   1.3s either way (graceful, exit 0). Launcher abort during startup: ~11s before, 1-2s now.
 7. Without `DOCKER=1` the launcher still `exec`s docker, exactly as before.
 
 ## Cache design
@@ -85,15 +99,19 @@ section "Requirements for DOCKER=1" (sysctl.d setting and how to undo it). For t
 
 ## Testing
 
-There is no automated test suite. Two layers have been used:
+There is no CI. Two layers have been used:
 
-**Stubbed `docker`** (no daemon needed). Put a fake `docker` script first on `PATH` that logs every call
+**Stubbed `docker`** (no daemon needed): `tests/stubbed-docker.sh` runs the cases below and then a set of
+mutants (the launcher with one fix removed) that each must make a test fail. Run it after every launcher
+change; `tests/stubbed-docker.sh test_prune` runs a single test. Its description of the approach: Put a fake `docker` script first on `PATH` that logs every call
 and is steered by environment variables (pod exit code, long-running pod, slow sidecar start, name
 conflict, dead sidecar, `volume rm` results, failing `volume ls`). Override `HOME` and `XDG_STATE_HOME`
 and set `COPILOT_POD_NO_UPDATE=1`. Make each test discriminating: copy the launcher without the fix
 (`sed '/line/d'`) and check that the test fails there. Covered this way: command sequence, exit-code
 propagation, cache create/reuse/prune (old, young, in-use, missing stamps, paths with spaces),
-exclusivity conflict, startup and double signals, early sidecar exit.
+exclusivity conflict, TERM/INT/HUP during startup and while the pod runs, a second signal during
+cleanup, a stop during pod creation, early sidecar exit. The INT tests start the launcher with `set -m`:
+a background job of a non-interactive shell otherwise has SIGINT ignored.
 
 **Real Docker checklist** (run from a project folder; replace the alias with the full path to
 `copilot-pod` inside `bash -c`):
@@ -105,13 +123,19 @@ DOCKER=1 DOCKER_CACHE=1 copilot-pod docker pull hello-world        # then:
 DOCKER=1 DOCKER_CACHE=1 copilot-pod docker images                  # "reusing ... (1 images ...)"
 DOCKER=1 DOCKER_CACHE=1 copilot-pod sleep 60                       # 2nd terminal, same folder:
 DOCKER=1 DOCKER_CACHE=1 copilot-pod true                           # must be rejected
-DOCKER=1 copilot-pod sleep 60 </dev/null & p=$!; sleep 30; kill -INT $p; wait $p   # 143 after ~2s
+# Signals. Startup (sidecar + pod) takes several seconds, so the signal must land once the pod runs: wait
+# for that (sleep 30 is a generous guess), then time `wait`. Expect 143, 2-3s after the signal (pod stop
+# 0.4s, sidecar stop 1.3s, the rest are docker calls). A signal DURING startup is a different path: exit
+# 130 (INT), 129 (HUP) or 143 (TERM) and 1-2s (the sidecar runs under --init, see invariant 6).
+DOCKER=1 copilot-pod sleep 60 </dev/null & p=$!; sleep 30; s=$SECONDS; kill -INT $p; wait $p; echo "exit=$? $((SECONDS-s))s"
 bash -c 'DOCKER=1 /path/to/copilot-pod sleep 60 </dev/null & p=$!; sleep 30; kill -TERM $p; wait $p'
 docker ps -a --filter name=copilot-pod; docker network ls --filter name=copilot-pod; \
   docker volume ls --filter name=copilot-pod                       # only the cache volume may remain
+# TLS must refuse everything without the pod's credentials. While a session runs, from a second container on
+# its network (copilot-pod-net-<id>, certs in copilot-pod-certs-<id>), each of these must fail: plain TCP to
+# 2376 ("HTTP request to an HTTPS server"), TLS without a client cert, TLS with a client cert from another CA
+# ("certificate required"), plain TCP to 2375. With --tlscacert/--tlscert/--tlskey from the certs volume it works.
 ```
 
-Verified so far on native Linux (Ubuntu, kernel 7.0, uid 1000): everything above. Not yet verified: macOS,
-Windows/WSL2, a host uid other than 1000 (the client certificates are `0644` in directories `1777`, so it
-should work), the double-Ctrl-C-during-startup cleanup and the 90-day prune on a real daemon.
-Current status and open items are tracked in the pull request description.
+Which of these checks have been run, where, and what is still open is tracked in the pull request description,
+not here, so it cannot go stale.

@@ -203,7 +203,7 @@ prune_dind_caches() {
     if out="$(docker volume rm "$name" 2>&1)"; then
       rm -f "$stamp"
       printf '%s●%s Removed Docker cache %s (unused for over %s days)\n' "$BOLD" "$RESET" "$name" "$max_days" >&2
-    elif [[ "$out" == *"No such volume"* ]]; then
+    elif grep -qi 'no such volume' <<<"$out"; then
       rm -f "$stamp"   # already gone (deleted by hand)
     fi
   done < <(find "$STATE_DIR" -type f -mmin +$(( max_days * 1440 )) -print0 2>/dev/null)
@@ -272,8 +272,11 @@ if [ -n "${DOCKER:-}" ]; then
     DIND_DATA_FLAGS=(-v "$DIND_CACHE_VOL:/home/rootless/.local/share/docker")
   fi
   # No --rm: a sidecar that dies during startup must still exist so its logs can be shown below;
-  # cleanup_dind removes it.
-  docker run -d --privileged \
+  # cleanup_dind removes it. --init: the image's entrypoint is a shell that runs as PID 1 and generates the
+  # TLS certificates before it execs dockerd; a PID 1 without a handler ignores SIGTERM, so an abort during
+  # startup would wait out the whole 10s stop timeout (exit 137). With tini as PID 1 the shell stops at once;
+  # after the exec, dockerd gets the signal and shuts down gracefully as before.
+  docker run -d --privileged --init \
     --name "$DIND_NAME" --label "copilot-pod.run=$RUN_ID" --network "$DIND_NET" --network-alias dind \
     --pids-limit="${PIDS:-4096}" \
     ${MEMORY:+--memory="$MEMORY"} ${CPUS:+--cpus="$CPUS"} \
@@ -333,9 +336,19 @@ fi
 # COPILOT_GITHUB_TOKEN / GH_TOKEN / GITHUB_TOKEN are forwarded only when set on the host (bare -e),
 # for token-based login instead of the interactive /login. They take precedence over stored
 # credentials, and they also authenticate `gh` inside the container.
+#
+# Interactive Bash (the default command) ignores SIGTERM even under --init, so `docker stop` would wait
+# out the 10s grace period and end in exit 137. SIGHUP makes it exit at once (status 129). Only the
+# default shell (no command, or a plain `bash`) gets it: other commands, including `bash -c ...`, keep the
+# image's stop signal (SIGTERM).
+STOP_FLAGS=()
+if [ -n "${DOCKER:-}" ] && { [ "$#" -eq 0 ] || { [ "$#" -eq 1 ] && [ "$1" = bash ]; }; }; then
+  STOP_FLAGS=(--stop-signal=SIGHUP)
+fi
 RUN_CMD=(docker run "${DOCKER_FLAGS[@]}" \
   ${DOCKER:+--name "$POD_NAME"} \
   ${DOCKER:+--init} \
+  ${STOP_FLAGS[@]+"${STOP_FLAGS[@]}"} \
   --cap-drop=ALL \
   --security-opt=no-new-privileges \
   --user "$(id -u):$(id -g)" \
@@ -361,12 +374,18 @@ RUN_CMD=(docker run "${DOCKER_FLAGS[@]}" \
 if [ -z "${DOCKER:-}" ]; then
   exec "${RUN_CMD[@]}"
 fi
-POD_PID=
-stop_pod() { docker stop -t 10 "$POD_NAME" >/dev/null 2>&1 || kill "$POD_PID" 2>/dev/null || true; }
+POD_PID=; STOP_REQUESTED=
+# A stop request is remembered and re-applied by the loop below until the pod is gone: before POD_PID is
+# known there is nothing to stop yet, and `docker stop` on a created-but-not-started container succeeds
+# without effect, after which the pod would start anyway.
+stop_pod() { STOP_REQUESTED=1; docker stop -t 10 "$POD_NAME" >/dev/null 2>&1 || { [ -z "$POD_PID" ] || kill "$POD_PID" 2>/dev/null; } || true; }
 trap stop_pod TERM INT HUP
 set +e
 "${RUN_CMD[@]}" <&0 &
 POD_PID=$!
-while kill -0 "$POD_PID" 2>/dev/null; do sleep 0.2; done
+while kill -0 "$POD_PID" 2>/dev/null; do
+  [ -z "$STOP_REQUESTED" ] || stop_pod
+  sleep 0.2
+done
 wait "$POD_PID"
 exit $?
