@@ -7,6 +7,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: macos-probe-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   probe:
     strategy:
@@ -14,7 +18,7 @@ jobs:
       matrix:
         os: [macos-latest, macos-15-intel]
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -41,16 +45,33 @@ jobs:
           done
           exit "$rc"
 
-      - name: Stub tests (system Bash 3.2 first in PATH)
-        continue-on-error: true
-        run: PATH=/bin:/usr/bin:$PATH /bin/bash tests/stubbed-docker.sh 2>&1 | grep -v '^  ok ' | head -80
-
-      - name: Docker on this runner?
+      # macOS has no timeout(1): a watchdog kills the run after 6 minutes, the output is kept in a file.
+      - name: Stub tests (system Bash 3.2 first in PATH, 6 minute watchdog)
         continue-on-error: true
         run: |
-          docker version 2>&1 | head -5 || true
-          echo "--- colima via brew (qemu), time-boxed"
-          brew install colima docker 2>&1 | tail -3
-          ( colima start --vm-type qemu --cpu 2 --memory 4 --disk 20 2>&1 | tail -25 ) &
-          sleep 600; docker info 2>&1 | head -8 || true; colima status 2>&1 | head -5 || true
+          export PATH=/bin:/usr/bin:$PATH
+          /bin/bash tests/stubbed-docker.sh > "$RUNNER_TEMP/stub.out" 2>&1 &
+          p=$!
+          ( sleep 360; kill "$p" 2>/dev/null ) &
+          w=$!
+          wait "$p"; rc=$?
+          kill "$w" 2>/dev/null
+          echo "stub tests exit: $rc (143 = killed by the watchdog)"
+          echo "--- ok count: $(grep -c '^  ok ' "$RUNNER_TEMP/stub.out")  FAILED: $(grep -c 'FAILED' "$RUNNER_TEMP/stub.out")"
+          echo "--- everything that is not ok:"; grep -v '^  ok ' "$RUNNER_TEMP/stub.out" | head -70
+
+      - name: Docker on this runner? (Colima via brew, time-boxed)
+        continue-on-error: true
+        run: |
+          echo "--- docker before: $(command -v docker || echo none)"
+          brew install colima docker 2>&1 | tail -2
+          colima start --vm-type qemu --cpu 2 --memory 4 --disk 20 > "$RUNNER_TEMP/colima.out" 2>&1 &
+          p=$!
+          for i in $(seq 1 36); do
+            kill -0 "$p" 2>/dev/null || break
+            sleep 10
+          done
+          kill "$p" 2>/dev/null
+          echo "--- colima start output (tail):"; tail -30 "$RUNNER_TEMP/colima.out"
+          echo "--- docker info:"; docker info 2>&1 | head -8 || true
           colima list 2>&1 || true
