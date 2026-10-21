@@ -137,7 +137,7 @@ p=$!
     alive=; for q in $pids; do kill -0 "$q" 2>/dev/null && alive=1; done
     [ -n "$alive" ] || break; sleep 0.2
   done
-  kill -KILL $pids 2>/dev/null ) &
+  kill -KILL $pids $(tree "$p") 2>/dev/null ) &   # the snapshot, and what the command started after the TERM (cleanup)
 w=$!
 wait "$p"; rc=$?
 if [ -e "$flag" ]; then wait "$w" 2>/dev/null; rm -f "$flag"; exit 124; fi   # let the KILL stage finish
@@ -207,6 +207,12 @@ test_timeout_standin() {   # the stand-in for a missing timeout(1): status, 124,
   [ "$rc" = 124 ] || fail "TERM-deaf child: exit $rc, expected 124"
   [ -s "$T/deaf.pid" ] || fail "the TERM-deaf fixture did not start"
   ! kill -0 "$(cat "$T/deaf.pid")" 2>/dev/null || { kill -KILL "$(cat "$T/deaf.pid")" 2>/dev/null; fail "a descendant that ignores TERM survived"; }
+  # on TERM the command starts a new child that hangs, as the launcher's cleanup does: not in the snapshot, but still killed
+  printf '%s\n' 'trap '"'"'sleep 73 & echo $! > "$1"; wait'"'"' TERM; sleep 74 & wait' > "$T/cleanup.sh"
+  "$t" 1 bash "$T/cleanup.sh" "$T/late.pid"; rc=$?
+  [ "$rc" = 124 ] || fail "late child: exit $rc, expected 124"
+  [ -s "$T/late.pid" ] || fail "the late-child fixture did not start its cleanup child"
+  ! kill -0 "$(cat "$T/late.pid")" 2>/dev/null || { kill -KILL "$(cat "$T/late.pid")" 2>/dev/null; fail "a child started after the TERM survived"; }
 }
 test_plain_exec() {   # without DOCKER=1 the launcher only execs docker run (invariant 7)
   setup_case; launch STUB_POD_EXIT=3 -- true
