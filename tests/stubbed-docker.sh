@@ -119,9 +119,9 @@ case "${1:-}" in -s) echo "${STUB_UNAME:-Linux}" ;; *) exec /usr/bin/uname "$@" 
 STUB
 chmod +x "$BIN/id" "$BIN/uname"
 # macOS has no timeout(1): a stand-in with its contract (the command's status, 124 when it ran out of time).
-# STUB_TIMEOUT_STANDIN=1 uses it even where timeout exists, to test it on Linux.
-{ command -v timeout >/dev/null 2>&1 && [ -z "${STUB_TIMEOUT_STANDIN:-}" ]; } || {
-  cat >"$BIN/timeout" <<'STUB'
+# It is always written (test_timeout_standin tests it on every platform) and used where timeout(1) is missing;
+# STUB_TIMEOUT_STANDIN=1 uses it even where timeout exists.
+cat >"$BIN/timeout-standin" <<'STUB'
 #!/usr/bin/env bash
 secs="$1"; shift
 flag="$(mktemp)"; rm -f "$flag"
@@ -130,15 +130,22 @@ flag="$(mktemp)"; rm -f "$flag"
 tree() { local c; for c in $(pgrep -P "$1" 2>/dev/null); do tree "$c"; done; echo "$1"; }
 "$@" &
 p=$!
-( sleep "$secs"; : > "$flag"; kill -TERM $(tree "$p") 2>/dev/null; sleep 2; kill -KILL $(tree "$p") 2>/dev/null ) &
+# The tree is taken once, before the first signal: a child whose parent exited on TERM would be lost to a later
+# look, and the KILL after the grace period must still reach it.
+( sleep "$secs"; pids="$(tree "$p")"; : > "$flag"; kill -TERM $pids 2>/dev/null
+  for _ in 1 2 3 4 5 6 7 8 9 10; do   # up to 2 seconds of grace, less when everything is gone
+    alive=; for q in $pids; do kill -0 "$q" 2>/dev/null && alive=1; done
+    [ -n "$alive" ] || break; sleep 0.2
+  done
+  kill -KILL $pids 2>/dev/null ) &
 w=$!
 wait "$p"; rc=$?
+if [ -e "$flag" ]; then wait "$w" 2>/dev/null; rm -f "$flag"; exit 124; fi   # let the KILL stage finish
 kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
-if [ -e "$flag" ]; then rm -f "$flag"; exit 124; fi
 exit "$rc"
 STUB
-  chmod +x "$BIN/timeout"
-}
+chmod +x "$BIN/timeout-standin"
+{ command -v timeout >/dev/null 2>&1 && [ -z "${STUB_TIMEOUT_STANDIN:-}" ]; } || cp "$BIN/timeout-standin" "$BIN/timeout"
 
 # ---- harness -------------------------------------------------------------------------------------------
 # Portable between GNU and BSD (macOS) userlands.
@@ -181,6 +188,19 @@ order() {    # order <regex>... : first match of each appears in this order
 wait_for() { local _; for _ in $(seq 1 100); do [ -e "$1" ] && return 0; sleep 0.1; done; fail "timed out waiting for $1"; }
 
 # ---- tests ---------------------------------------------------------------------------------------------
+test_timeout_standin() {   # the stand-in for a missing timeout(1): status, 124, hung and TERM-deaf descendants
+  local t="$BIN/timeout-standin" s rc
+  "$t" 5 true || fail "true was not passed through"
+  "$t" 5 sh -c 'exit 7'; rc=$?; [ "$rc" = 7 ] || fail "exit status 7 became $rc"
+  s=$SECONDS; "$t" 1 sleep 5; rc=$?; [ "$rc" = 124 ] && [ $((SECONDS - s)) -le 3 ] || fail "sleep: exit $rc after $((SECONDS - s))s, expected 124 within 3s"
+  # the launcher defers its TERM trap while a foreground child hangs: the child must be ended, not waited for
+  s=$SECONDS; "$t" 1 bash -c 'trap "exit 143" TERM; sleep 71'; rc=$?
+  [ "$rc" = 124 ] && [ $((SECONDS - s)) -le 3 ] || fail "deferred TERM: exit $rc after $((SECONDS - s))s, expected 124 within 3s"
+  # the parent exits on TERM but its child ignores it: the child must be gone afterwards (KILL after the grace period)
+  "$t" 1 bash -c 'bash -c "trap \"\" TERM; sleep 72" & trap "exit 0" TERM; wait'; rc=$?
+  [ "$rc" = 124 ] || fail "TERM-deaf child: exit $rc, expected 124"
+  ! ps -eo args | grep -q '^sleep 72$' || { ps -eo pid,args | awk '$2 == "sleep" && $3 == 72 { system("kill -KILL " $1) }'; fail "a descendant that ignores TERM survived"; }
+}
 test_plain_exec() {   # without DOCKER=1 the launcher only execs docker run (invariant 7)
   setup_case; launch STUB_POD_EXIT=3 -- true
   rc_is 3
