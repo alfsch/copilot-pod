@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Tests for the copilot-pod launcher against a stubbed `docker` (no daemon needed). See "Testing" in
-# docs/docker-sidecar.md. Usage: tests/stubbed-docker.sh [test-name ...]   (default: all tests + mutants)
+# docs/docker-sidecar.md. Usage: tests/stubbed-docker.sh [--no-mutants] [test-name ...]   (default: all tests + mutants)
 # Everything the daemon would do (rootless sidecar, TLS, real volumes, real signals through Docker) is
 # NOT covered here; use the real-Docker checklist in the docs for that.
 set -uo pipefail
@@ -118,8 +118,39 @@ cat >"$BIN/uname" <<'STUB'
 case "${1:-}" in -s) echo "${STUB_UNAME:-Linux}" ;; *) exec /usr/bin/uname "$@" ;; esac
 STUB
 chmod +x "$BIN/id" "$BIN/uname"
+# macOS has no timeout(1): a stand-in with its contract (the command's status, 124 when it ran out of time).
+# It is always written (test_timeout_standin tests it on every platform) and used where timeout(1) is missing;
+# STUB_TIMEOUT_STANDIN=1 uses it even where timeout exists.
+cat >"$BIN/timeout-standin" <<'STUB'
+#!/usr/bin/env bash
+secs="$1"; shift
+flag="$(mktemp)"; rm -f "$flag"
+# The command and everything below it, children first: the launcher defers its TERM trap while a foreground
+# command runs, so signalling only its pid would not end a hung child.
+tree() { local c; for c in $(pgrep -P "$1" 2>/dev/null); do tree "$c"; done; echo "$1"; }
+"$@" &
+p=$!
+# The tree is taken once, before the first signal: a child whose parent exited on TERM would be lost to a later
+# look, and the KILL after the grace period must still reach it.
+( sleep "$secs"; pids="$(tree "$p")"; : > "$flag"; kill -TERM $pids 2>/dev/null
+  for _ in 1 2 3 4 5 6 7 8 9 10; do   # up to 2 seconds of grace, less when everything is gone
+    alive=; for q in $pids; do kill -0 "$q" 2>/dev/null && alive=1; done
+    [ -n "$alive" ] || break; sleep 0.2
+  done
+  kill -KILL $pids $(tree "$p") 2>/dev/null ) &   # the snapshot, and what the command started after the TERM (cleanup)
+w=$!
+wait "$p"; rc=$?
+if [ -e "$flag" ]; then wait "$w" 2>/dev/null; rm -f "$flag"; exit 124; fi   # let the KILL stage finish
+kill $(tree "$w") 2>/dev/null; wait "$w" 2>/dev/null   # the watchdog and its timer: a lingering sleep holds a captured pipe open
+exit "$rc"
+STUB
+chmod +x "$BIN/timeout-standin"
+{ command -v timeout >/dev/null 2>&1 && [ -z "${STUB_TIMEOUT_STANDIN:-}" ]; } || cp "$BIN/timeout-standin" "$BIN/timeout"
 
 # ---- harness -------------------------------------------------------------------------------------------
+# Portable between GNU and BSD (macOS) userlands.
+sha16() { { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16; }
+touch_ago() { local days="$1"; shift; touch -d "$days days ago" "$@" 2>/dev/null || touch -t "$(date -v-"$days"d +%Y%m%d%H%M)" "$@"; }
 fail() { echo "    FAIL: $*" >&2; [ -f "$CASE/out" ] && sed 's/^/    out| /' "$CASE/out" >&2; [ -f "$CASE/err" ] && sed 's/^/    err| /' "$CASE/err" >&2; [ -f "$STUB_LOG" ] && sed 's/^/    log| /' "$STUB_LOG" >&2; exit 1; }
 setup_case() {
   CASE="$(mktemp -d "$T/case.XXXXXX")"
@@ -127,7 +158,7 @@ setup_case() {
   STATE="$H/state/copilot-pod/caches"
   mkdir -p "$PROJ" "$H"
   export STUB_LOG="$CASE/docker.log" STUB_DIR="$CASE/stub"; mkdir -p "$STUB_DIR"; : > "$STUB_LOG"
-  HASH="$(cd "$PROJ" && { pwd -P; echo 1000:1000; } | sha256sum | cut -c1-16)"   # the stub reports uid and gid 1000
+  HASH="$(cd "$PROJ" && { pwd -P; echo 1000:1000; } | sha16)"   # the stub reports uid and gid 1000
 }
 launch_env() { cd "$PROJ" && HOME="$H" XDG_STATE_HOME="$H/state" COPILOT_POD_NO_UPDATE=1 PATH="$BIN:$PATH" "$@"; }
 launch() {   # launch <env VAR=...>... -- args   (foreground; sets RC)
@@ -157,6 +188,32 @@ order() {    # order <regex>... : first match of each appears in this order
 wait_for() { local _; for _ in $(seq 1 100); do [ -e "$1" ] && return 0; sleep 0.1; done; fail "timed out waiting for $1"; }
 
 # ---- tests ---------------------------------------------------------------------------------------------
+test_timeout_standin() {   # the stand-in for a missing timeout(1): status, 124, hung and TERM-deaf descendants
+  local t="$BIN/timeout-standin" s rc
+  "$t" 5 true || fail "true was not passed through"
+  "$t" 5 sh -c 'exit 7'; rc=$?; [ "$rc" = 7 ] || fail "exit status 7 became $rc"
+  # output captured through a pipe must not wait for the watchdog's timer after the command has ended
+  s=$SECONDS; out="$("$t" 30 sh -c 'echo hi')"; rc=$?
+  [ "$out" = hi ] && [ "$rc" = 0 ] && [ $((SECONDS - s)) -le 3 ] || fail "captured output waited $((SECONDS - s))s for the timer (out='$out', exit $rc)"
+  s=$SECONDS; "$t" 1 sleep 5; rc=$?; [ "$rc" = 124 ] && [ $((SECONDS - s)) -le 3 ] || fail "sleep: exit $rc after $((SECONDS - s))s, expected 124 within 3s"
+  # the launcher defers its TERM trap while a foreground child hangs: the child must be ended, not waited for
+  s=$SECONDS; "$t" 1 bash -c 'trap "exit 143" TERM; sleep 71'; rc=$?
+  [ "$rc" = 124 ] && [ $((SECONDS - s)) -le 3 ] || fail "deferred TERM: exit $rc after $((SECONDS - s))s, expected 124 within 3s"
+  # the parent exits on TERM but its child ignores it: the child must be gone afterwards (KILL after the grace period).
+  # The child records its own pid (and becomes the sleep), so only that process is looked at and, if need be, killed.
+  printf '%s\n' 'trap "" TERM; echo $$ > "$1"; exec sleep 72' > "$T/deaf.sh"
+  printf '%s\n' 'bash "$1" "$2" & trap "exit 0" TERM; wait' > "$T/parent.sh"
+  "$t" 1 bash "$T/parent.sh" "$T/deaf.sh" "$T/deaf.pid"; rc=$?
+  [ "$rc" = 124 ] || fail "TERM-deaf child: exit $rc, expected 124"
+  [ -s "$T/deaf.pid" ] || fail "the TERM-deaf fixture did not start"
+  ! kill -0 "$(cat "$T/deaf.pid")" 2>/dev/null || { kill -KILL "$(cat "$T/deaf.pid")" 2>/dev/null; fail "a descendant that ignores TERM survived"; }
+  # on TERM the command starts a new child that hangs, as the launcher's cleanup does: not in the snapshot, but still killed
+  printf '%s\n' 'trap '"'"'sleep 73 & echo $! > "$1"; wait'"'"' TERM; sleep 74 & wait' > "$T/cleanup.sh"
+  "$t" 1 bash "$T/cleanup.sh" "$T/late.pid"; rc=$?
+  [ "$rc" = 124 ] || fail "late child: exit $rc, expected 124"
+  [ -s "$T/late.pid" ] || fail "the late-child fixture did not start its cleanup child"
+  ! kill -0 "$(cat "$T/late.pid")" 2>/dev/null || { kill -KILL "$(cat "$T/late.pid")" 2>/dev/null; fail "a child started after the TERM survived"; }
+}
 test_plain_exec() {   # without DOCKER=1 the launcher only execs docker run (invariant 7)
   setup_case; launch STUB_POD_EXIT=3 -- true
   rc_is 3
@@ -237,12 +294,12 @@ test_host_uid_build_fails() {   # no sidecar without its image
 }
 test_host_uid_cache() {   # the cache volume of the derived image is separate from the one owned by uid 1000
   setup_case; launch DOCKER=1 DOCKER_CACHE=1 STUB_UID=1001 -- true
-  local h; h="$(cd "$PROJ" && { pwd -P; echo 1001:1000; } | sha256sum | cut -c1-16)"
+  local h; h="$(cd "$PROJ" && { pwd -P; echo 1001:1000; } | sha16)"
   rc_is 0; in_out "created new copilot-pod-docker-$h"; logged "^run -d .*--name copilot-pod-dind-cache-$h "
   [ "$h" != "$HASH" ] || fail "uid not part of the hash"
   # same uid, other primary group (sg, newgrp): another derived image, so another volume
   setup_case; launch DOCKER=1 DOCKER_CACHE=1 STUB_UID=1001 STUB_GID=1002 -- true
-  local h2; h2="$(cd "$PROJ" && { pwd -P; echo 1001:1002; } | sha256sum | cut -c1-16)"
+  local h2; h2="$(cd "$PROJ" && { pwd -P; echo 1001:1002; } | sha16)"
   rc_is 0; in_out "created new copilot-pod-docker-$h2"; [ "$h2" != "$h" ] || fail "gid not part of the hash"
   # a user-set DIND_IMAGE keeps the stock image (uid 1000): same cache as on a uid 1000 host, not the derived one
   setup_case; launch DOCKER=1 DOCKER_CACHE=1 STUB_UID=1001 DIND_IMAGE=my/dind:1 -- true
@@ -252,7 +309,7 @@ test_prune() {   # old stamps pruned; young, in-use and foreign files kept; gone
   setup_case; mkdir -p "$STATE"
   local old=copilot-pod-docker-aaaaaaaaaaaaaaaa young=copilot-pod-docker-bbbbbbbbbbbbbbbb \
         inuse=copilot-pod-docker-cccccccccccccccc gone=copilot-pod-docker-dddddddddddddddd
-  touch -d '3 days ago' "$STATE/$old" "$STATE/$inuse" "$STATE/$gone" "$STATE/not-a-cache" "$STATE/copilot-pod-docker-short"
+  touch_ago 3 "$STATE/$old" "$STATE/$inuse" "$STATE/$gone" "$STATE/not-a-cache" "$STATE/copilot-pod-docker-short"
   touch "$STATE/$young"
   launch DOCKER=1 DOCKER_CACHE=1 DOCKER_CACHE_MAX_AGE_DAYS=1 STUB_RM_INUSE="$inuse" STUB_RM_MISSING="$gone" -- true
   rc_is 0
@@ -265,7 +322,7 @@ test_prune() {   # old stamps pruned; young, in-use and foreign files kept; gone
   not_logged 'volume rm (not-a-cache|copilot-pod-docker-short)'; [ -e "$STATE/not-a-cache" ] || fail "foreign file removed"
 }
 test_prune_settings() {   # 0 disables, garbage is rejected before anything starts
-  setup_case; mkdir -p "$STATE"; touch -d '400 days ago' "$STATE/copilot-pod-docker-aaaaaaaaaaaaaaaa"
+  setup_case; mkdir -p "$STATE"; touch_ago 400 "$STATE/copilot-pod-docker-aaaaaaaaaaaaaaaa"
   launch DOCKER=1 DOCKER_CACHE=1 DOCKER_CACHE_MAX_AGE_DAYS=0 -- true
   rc_is 0; not_logged 'volume rm copilot-pod-docker-'
   setup_case; launch DOCKER=1 DOCKER_CACHE=1 DOCKER_CACHE_MAX_AGE_DAYS=abc -- true
@@ -408,6 +465,8 @@ run_mutants() {
 
 # ---- main ----------------------------------------------------------------------------------------------
 if [ "${1:-}" = --inner ]; then "$2"; exit $?; fi
+# --no-mutants: all tests, but not the mutants (which test the launcher's logic, not the platform).
+NO_MUTANTS=; if [ "${1:-}" = --no-mutants ]; then NO_MUTANTS=1; shift; fi
 # No mapfile (not in Bash 3.2) and no silent empty run: an empty list would skip the baseline and let every
 # mutant count as killed.
 tests=("$@")
@@ -420,5 +479,5 @@ failed=0
 for t in "${tests[@]}"; do
   if ( "$t" ); then echo "  ok        $t"; else echo "  FAILED    $t"; failed=1; fi
 done
-if [ $# -eq 0 ] && [ "$LAUNCHER" = "$ROOT/copilot-pod" ]; then echo "mutants:"; run_mutants || failed=1; fi
+if [ $# -eq 0 ] && [ -z "$NO_MUTANTS" ] && [ "$LAUNCHER" = "$ROOT/copilot-pod" ]; then echo "mutants:"; run_mutants || failed=1; fi
 exit $failed

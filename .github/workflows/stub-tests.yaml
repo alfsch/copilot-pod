@@ -45,3 +45,30 @@ jobs:
       # Tests, then the mutants: each launcher with one fix removed must make a test fail.
       - name: Stub tests
         run: tests/stubbed-docker.sh
+
+  # The same tests on macOS: the system Bash 3.2 and the BSD userland (no timeout, GNU date or touch -d), which the
+  # Linux job never sees. The system Bash comes first in PATH so that the launcher's `env bash` shebang is it, too.
+  # No mutants: they test the launcher's logic, which the Linux job covers. Needs no Docker (the tests stub it).
+  stub-tests-macos:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Platform
+        run: |
+          uname -sm; sw_vers -productVersion; /bin/bash --version | head -n1
+          command -v timeout || echo "no timeout(1), as on a Mac"
+
+      - name: Syntax check with the system Bash 3.2
+        run: |
+          rc=0
+          for f in copilot-pod install.sh uninstall.sh tests/stubbed-docker.sh tests/integration.sh; do
+            /bin/bash -n "$f" || rc=1
+          done
+          exit "$rc"
+
+      - name: Stub tests
+        run: PATH=/bin:/usr/bin:$PATH /bin/bash tests/stubbed-docker.sh --no-mutants
