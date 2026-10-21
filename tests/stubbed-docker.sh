@@ -125,23 +125,22 @@ cat >"$BIN/timeout-standin" <<'STUB'
 #!/usr/bin/env bash
 secs="$1"; shift
 flag="$(mktemp)"; rm -f "$flag"
-# The command and everything below it, children first: the launcher defers its TERM trap while a foreground
-# command runs, so signalling only its pid would not end a hung child.
-tree() { local c; for c in $(pgrep -P "$1" 2>/dev/null); do tree "$c"; done; echo "$1"; }
+# Job control gives every background job a process group of its own (pgid = its pid). The command's group holds
+# everything it starts, children started after a TERM and children whose parent has exited included, so signalling
+# the group reaches them all: a hung child, one that ignores TERM, a cleanup child. The launcher defers its TERM
+# trap while a foreground command runs, so signalling only its pid would not end a hung child.
+set -m
 "$@" &
 p=$!
-# The tree is taken once, before the first signal: a child whose parent exited on TERM would be lost to a later
-# look, and the KILL after the grace period must still reach it.
-( sleep "$secs"; pids="$(tree "$p")"; : > "$flag"; kill -TERM $pids 2>/dev/null
+( sleep "$secs"; : > "$flag"; kill -TERM -- -"$p" 2>/dev/null
   for _ in 1 2 3 4 5 6 7 8 9 10; do   # up to 2 seconds of grace, less when everything is gone
-    alive=; for q in $pids; do kill -0 "$q" 2>/dev/null && alive=1; done
-    [ -n "$alive" ] || break; sleep 0.2
+    kill -0 -- -"$p" 2>/dev/null || break; sleep 0.2
   done
-  kill -KILL $pids $(tree "$p") 2>/dev/null ) &   # the snapshot, and what the command started after the TERM (cleanup)
+  kill -KILL -- -"$p" 2>/dev/null ) &
 w=$!
-wait "$p"; rc=$?
+wait "$p" 2>/dev/null; rc=$?
 if [ -e "$flag" ]; then wait "$w" 2>/dev/null; rm -f "$flag"; exit 124; fi   # let the KILL stage finish
-kill $(tree "$w") 2>/dev/null; wait "$w" 2>/dev/null   # the watchdog and its timer: a lingering sleep holds a captured pipe open
+kill -- -"$w" 2>/dev/null; wait "$w" 2>/dev/null   # the watchdog and its timer (a lingering sleep holds a captured pipe open)
 exit "$rc"
 STUB
 chmod +x "$BIN/timeout-standin"
@@ -213,6 +212,13 @@ test_timeout_standin() {   # the stand-in for a missing timeout(1): status, 124,
   [ "$rc" = 124 ] || fail "late child: exit $rc, expected 124"
   [ -s "$T/late.pid" ] || fail "the late-child fixture did not start its cleanup child"
   ! kill -0 "$(cat "$T/late.pid")" 2>/dev/null || { kill -KILL "$(cat "$T/late.pid")" 2>/dev/null; fail "a child started after the TERM survived"; }
+  # the same, but the command exits right after starting that child: the child is reparented and only the process
+  # group still holds it
+  printf '%s\n' 'trap '"'"'sleep 75 & echo $! > "$1"; exit 0'"'"' TERM; sleep 76 & wait' > "$T/orphan.sh"
+  "$t" 1 bash "$T/orphan.sh" "$T/orphan.pid"; rc=$?
+  [ "$rc" = 124 ] || fail "reparented late child: exit $rc, expected 124"
+  [ -s "$T/orphan.pid" ] || fail "the reparenting fixture did not start its child"
+  ! kill -0 "$(cat "$T/orphan.pid")" 2>/dev/null || { kill -KILL "$(cat "$T/orphan.pid")" 2>/dev/null; fail "a child whose parent had exited survived"; }
 }
 test_plain_exec() {   # without DOCKER=1 the launcher only execs docker run (invariant 7)
   setup_case; launch STUB_POD_EXIT=3 -- true
