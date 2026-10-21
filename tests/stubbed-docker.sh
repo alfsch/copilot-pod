@@ -141,7 +141,7 @@ p=$!
 w=$!
 wait "$p"; rc=$?
 if [ -e "$flag" ]; then wait "$w" 2>/dev/null; rm -f "$flag"; exit 124; fi   # let the KILL stage finish
-kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
+kill $(tree "$w") 2>/dev/null; wait "$w" 2>/dev/null   # the watchdog and its timer: a lingering sleep holds a captured pipe open
 exit "$rc"
 STUB
 chmod +x "$BIN/timeout-standin"
@@ -192,6 +192,9 @@ test_timeout_standin() {   # the stand-in for a missing timeout(1): status, 124,
   local t="$BIN/timeout-standin" s rc
   "$t" 5 true || fail "true was not passed through"
   "$t" 5 sh -c 'exit 7'; rc=$?; [ "$rc" = 7 ] || fail "exit status 7 became $rc"
+  # output captured through a pipe must not wait for the watchdog's timer after the command has ended
+  s=$SECONDS; out="$("$t" 30 sh -c 'echo hi')"; rc=$?
+  [ "$out" = hi ] && [ "$rc" = 0 ] && [ $((SECONDS - s)) -le 3 ] || fail "captured output waited $((SECONDS - s))s for the timer (out='$out', exit $rc)"
   s=$SECONDS; "$t" 1 sleep 5; rc=$?; [ "$rc" = 124 ] && [ $((SECONDS - s)) -le 3 ] || fail "sleep: exit $rc after $((SECONDS - s))s, expected 124 within 3s"
   # the launcher defers its TERM trap while a foreground child hangs: the child must be ended, not waited for
   s=$SECONDS; "$t" 1 bash -c 'trap "exit 143" TERM; sleep 71'; rc=$?
