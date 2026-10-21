@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Tests for the copilot-pod launcher against a stubbed `docker` (no daemon needed). See "Testing" in
-# docs/docker-sidecar.md. Usage: tests/stubbed-docker.sh [test-name ...]   (default: all tests + mutants)
+# docs/docker-sidecar.md. Usage: tests/stubbed-docker.sh [--no-mutants] [test-name ...]   (default: all tests + mutants)
 # Everything the daemon would do (rootless sidecar, TLS, real volumes, real signals through Docker) is
 # NOT covered here; use the real-Docker checklist in the docs for that.
 set -uo pipefail
@@ -118,8 +118,28 @@ cat >"$BIN/uname" <<'STUB'
 case "${1:-}" in -s) echo "${STUB_UNAME:-Linux}" ;; *) exec /usr/bin/uname "$@" ;; esac
 STUB
 chmod +x "$BIN/id" "$BIN/uname"
+# macOS has no timeout(1): a stand-in with its contract (the command's status, 124 when it ran out of time).
+command -v timeout >/dev/null 2>&1 || {
+  cat >"$BIN/timeout" <<'STUB'
+#!/usr/bin/env bash
+secs="$1"; shift
+flag="$(mktemp)"; rm -f "$flag"
+"$@" &
+p=$!
+( sleep "$secs"; : > "$flag"; kill "$p" 2>/dev/null ) &
+w=$!
+wait "$p"; rc=$?
+kill "$w" 2>/dev/null; wait "$w" 2>/dev/null
+if [ -e "$flag" ]; then rm -f "$flag"; exit 124; fi
+exit "$rc"
+STUB
+  chmod +x "$BIN/timeout"
+}
 
 # ---- harness -------------------------------------------------------------------------------------------
+# Portable between GNU and BSD (macOS) userlands.
+sha16() { { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16; }
+touch_ago() { local days="$1"; shift; touch -d "$days days ago" "$@" 2>/dev/null || touch -t "$(date -v-"$days"d +%Y%m%d%H%M)" "$@"; }
 fail() { echo "    FAIL: $*" >&2; [ -f "$CASE/out" ] && sed 's/^/    out| /' "$CASE/out" >&2; [ -f "$CASE/err" ] && sed 's/^/    err| /' "$CASE/err" >&2; [ -f "$STUB_LOG" ] && sed 's/^/    log| /' "$STUB_LOG" >&2; exit 1; }
 setup_case() {
   CASE="$(mktemp -d "$T/case.XXXXXX")"
@@ -127,7 +147,7 @@ setup_case() {
   STATE="$H/state/copilot-pod/caches"
   mkdir -p "$PROJ" "$H"
   export STUB_LOG="$CASE/docker.log" STUB_DIR="$CASE/stub"; mkdir -p "$STUB_DIR"; : > "$STUB_LOG"
-  HASH="$(cd "$PROJ" && { pwd -P; echo 1000:1000; } | sha256sum | cut -c1-16)"   # the stub reports uid and gid 1000
+  HASH="$(cd "$PROJ" && { pwd -P; echo 1000:1000; } | sha16)"   # the stub reports uid and gid 1000
 }
 launch_env() { cd "$PROJ" && HOME="$H" XDG_STATE_HOME="$H/state" COPILOT_POD_NO_UPDATE=1 PATH="$BIN:$PATH" "$@"; }
 launch() {   # launch <env VAR=...>... -- args   (foreground; sets RC)
@@ -237,12 +257,12 @@ test_host_uid_build_fails() {   # no sidecar without its image
 }
 test_host_uid_cache() {   # the cache volume of the derived image is separate from the one owned by uid 1000
   setup_case; launch DOCKER=1 DOCKER_CACHE=1 STUB_UID=1001 -- true
-  local h; h="$(cd "$PROJ" && { pwd -P; echo 1001:1000; } | sha256sum | cut -c1-16)"
+  local h; h="$(cd "$PROJ" && { pwd -P; echo 1001:1000; } | sha16)"
   rc_is 0; in_out "created new copilot-pod-docker-$h"; logged "^run -d .*--name copilot-pod-dind-cache-$h "
   [ "$h" != "$HASH" ] || fail "uid not part of the hash"
   # same uid, other primary group (sg, newgrp): another derived image, so another volume
   setup_case; launch DOCKER=1 DOCKER_CACHE=1 STUB_UID=1001 STUB_GID=1002 -- true
-  local h2; h2="$(cd "$PROJ" && { pwd -P; echo 1001:1002; } | sha256sum | cut -c1-16)"
+  local h2; h2="$(cd "$PROJ" && { pwd -P; echo 1001:1002; } | sha16)"
   rc_is 0; in_out "created new copilot-pod-docker-$h2"; [ "$h2" != "$h" ] || fail "gid not part of the hash"
   # a user-set DIND_IMAGE keeps the stock image (uid 1000): same cache as on a uid 1000 host, not the derived one
   setup_case; launch DOCKER=1 DOCKER_CACHE=1 STUB_UID=1001 DIND_IMAGE=my/dind:1 -- true
@@ -252,7 +272,7 @@ test_prune() {   # old stamps pruned; young, in-use and foreign files kept; gone
   setup_case; mkdir -p "$STATE"
   local old=copilot-pod-docker-aaaaaaaaaaaaaaaa young=copilot-pod-docker-bbbbbbbbbbbbbbbb \
         inuse=copilot-pod-docker-cccccccccccccccc gone=copilot-pod-docker-dddddddddddddddd
-  touch -d '3 days ago' "$STATE/$old" "$STATE/$inuse" "$STATE/$gone" "$STATE/not-a-cache" "$STATE/copilot-pod-docker-short"
+  touch_ago 3 "$STATE/$old" "$STATE/$inuse" "$STATE/$gone" "$STATE/not-a-cache" "$STATE/copilot-pod-docker-short"
   touch "$STATE/$young"
   launch DOCKER=1 DOCKER_CACHE=1 DOCKER_CACHE_MAX_AGE_DAYS=1 STUB_RM_INUSE="$inuse" STUB_RM_MISSING="$gone" -- true
   rc_is 0
@@ -265,7 +285,7 @@ test_prune() {   # old stamps pruned; young, in-use and foreign files kept; gone
   not_logged 'volume rm (not-a-cache|copilot-pod-docker-short)'; [ -e "$STATE/not-a-cache" ] || fail "foreign file removed"
 }
 test_prune_settings() {   # 0 disables, garbage is rejected before anything starts
-  setup_case; mkdir -p "$STATE"; touch -d '400 days ago' "$STATE/copilot-pod-docker-aaaaaaaaaaaaaaaa"
+  setup_case; mkdir -p "$STATE"; touch_ago 400 "$STATE/copilot-pod-docker-aaaaaaaaaaaaaaaa"
   launch DOCKER=1 DOCKER_CACHE=1 DOCKER_CACHE_MAX_AGE_DAYS=0 -- true
   rc_is 0; not_logged 'volume rm copilot-pod-docker-'
   setup_case; launch DOCKER=1 DOCKER_CACHE=1 DOCKER_CACHE_MAX_AGE_DAYS=abc -- true
@@ -408,6 +428,8 @@ run_mutants() {
 
 # ---- main ----------------------------------------------------------------------------------------------
 if [ "${1:-}" = --inner ]; then "$2"; exit $?; fi
+# --no-mutants: all tests, but not the mutants (which test the launcher's logic, not the platform).
+NO_MUTANTS=; if [ "${1:-}" = --no-mutants ]; then NO_MUTANTS=1; shift; fi
 # No mapfile (not in Bash 3.2) and no silent empty run: an empty list would skip the baseline and let every
 # mutant count as killed.
 tests=("$@")
@@ -420,5 +442,5 @@ failed=0
 for t in "${tests[@]}"; do
   if ( "$t" ); then echo "  ok        $t"; else echo "  FAILED    $t"; failed=1; fi
 done
-if [ $# -eq 0 ] && [ "$LAUNCHER" = "$ROOT/copilot-pod" ]; then echo "mutants:"; run_mutants || failed=1; fi
+if [ $# -eq 0 ] && [ -z "$NO_MUTANTS" ] && [ "$LAUNCHER" = "$ROOT/copilot-pod" ]; then echo "mutants:"; run_mutants || failed=1; fi
 exit $failed
