@@ -199,10 +199,14 @@ test_timeout_standin() {   # the stand-in for a missing timeout(1): status, 124,
   # the launcher defers its TERM trap while a foreground child hangs: the child must be ended, not waited for
   s=$SECONDS; "$t" 1 bash -c 'trap "exit 143" TERM; sleep 71'; rc=$?
   [ "$rc" = 124 ] && [ $((SECONDS - s)) -le 3 ] || fail "deferred TERM: exit $rc after $((SECONDS - s))s, expected 124 within 3s"
-  # the parent exits on TERM but its child ignores it: the child must be gone afterwards (KILL after the grace period)
-  "$t" 1 bash -c 'bash -c "trap \"\" TERM; sleep 72" & trap "exit 0" TERM; wait'; rc=$?
+  # the parent exits on TERM but its child ignores it: the child must be gone afterwards (KILL after the grace period).
+  # The child records its own pid (and becomes the sleep), so only that process is looked at and, if need be, killed.
+  printf '%s\n' 'trap "" TERM; echo $$ > "$1"; exec sleep 72' > "$T/deaf.sh"
+  printf '%s\n' 'bash "$1" "$2" & trap "exit 0" TERM; wait' > "$T/parent.sh"
+  "$t" 1 bash "$T/parent.sh" "$T/deaf.sh" "$T/deaf.pid"; rc=$?
   [ "$rc" = 124 ] || fail "TERM-deaf child: exit $rc, expected 124"
-  ! ps -eo args | grep -q '^sleep 72$' || { ps -eo pid,args | awk '$2 == "sleep" && $3 == 72 { system("kill -KILL " $1) }'; fail "a descendant that ignores TERM survived"; }
+  [ -s "$T/deaf.pid" ] || fail "the TERM-deaf fixture did not start"
+  ! kill -0 "$(cat "$T/deaf.pid")" 2>/dev/null || { kill -KILL "$(cat "$T/deaf.pid")" 2>/dev/null; fail "a descendant that ignores TERM survived"; }
 }
 test_plain_exec() {   # without DOCKER=1 the launcher only execs docker run (invariant 7)
   setup_case; launch STUB_POD_EXIT=3 -- true
