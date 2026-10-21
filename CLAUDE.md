@@ -25,6 +25,8 @@ Runs the GitHub Copilot CLI in a hardened Docker container scoped to the current
   yq), majors included, as soon as the required checks pass (`renovate.json`), so those checks are the only
   review such an update gets. If a merged update breaks something the tests did not notice, the fix includes a
   new test for it. A test must not name a version Renovate bumps (a stub test once expected `docker:28-...`).
+- The stub tests also run on macOS (system Bash 3.2, BSD tools): keep them portable, with no `mapfile` and no
+  GNU-only flags (see the helpers in `tests/stubbed-docker.sh`).
 - Rootless DinD needs unprivileged user namespaces; on Ubuntu 24.04+ that means
   `kernel.apparmor_restrict_unprivileged_userns=0` for the test (set it back to `1` afterwards).
 - After every edit run `for f in copilot-pod install.sh uninstall.sh tests/stubbed-docker.sh; do bash -n "$f"; done`

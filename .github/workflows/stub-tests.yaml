@@ -57,6 +57,11 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Platform
+        run: |
+          uname -sm; sw_vers -productVersion; /bin/bash --version | head -n1
+          command -v timeout || echo "no timeout(1), as on a Mac"
+
       - name: Syntax check with the system Bash 3.2
         run: |
           rc=0
