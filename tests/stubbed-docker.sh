@@ -119,14 +119,18 @@ case "${1:-}" in -s) echo "${STUB_UNAME:-Linux}" ;; *) exec /usr/bin/uname "$@" 
 STUB
 chmod +x "$BIN/id" "$BIN/uname"
 # macOS has no timeout(1): a stand-in with its contract (the command's status, 124 when it ran out of time).
-command -v timeout >/dev/null 2>&1 || {
+# STUB_TIMEOUT_STANDIN=1 uses it even where timeout exists, to test it on Linux.
+{ command -v timeout >/dev/null 2>&1 && [ -z "${STUB_TIMEOUT_STANDIN:-}" ]; } || {
   cat >"$BIN/timeout" <<'STUB'
 #!/usr/bin/env bash
 secs="$1"; shift
 flag="$(mktemp)"; rm -f "$flag"
+# The command and everything below it, children first: the launcher defers its TERM trap while a foreground
+# command runs, so signalling only its pid would not end a hung child.
+tree() { local c; for c in $(pgrep -P "$1" 2>/dev/null); do tree "$c"; done; echo "$1"; }
 "$@" &
 p=$!
-( sleep "$secs"; : > "$flag"; kill "$p" 2>/dev/null ) &
+( sleep "$secs"; : > "$flag"; kill -TERM $(tree "$p") 2>/dev/null; sleep 2; kill -KILL $(tree "$p") 2>/dev/null ) &
 w=$!
 wait "$p"; rc=$?
 kill "$w" 2>/dev/null; wait "$w" 2>/dev/null

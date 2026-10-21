@@ -167,7 +167,7 @@ The stub tests run in CI (`.github/workflows/stub-tests.yaml`: syntax check, She
 requests and pushes to main) and need no Docker daemon. A second job, `stub-tests-macos`, runs the tests without the
 mutants on `macos-latest` with the system Bash 3.2 and the BSD userland, so they must stay portable: no `mapfile`,
 no GNU-only flags (`timeout`, `touch -d`, `date -d`, `stat -c`; use the helpers `sha16` and `touch_ago` and the
-`timeout` stand-in in the test file). Docker itself does not run on hosted Apple-silicon runners (no hypervisor), and
+`timeout` stand-in in the test file; `STUB_TIMEOUT_STANDIN=1` forces the stand-in on Linux to test it). Docker itself does not run on hosted Apple-silicon runners (no hypervisor), and
 Colima on the Intel runner worked in one probe and hung in the next, so the integration tests stay Linux-only. `tests/integration.sh` runs the essential real-daemon checks
 (`.github/workflows/integration-tests.yaml`, a real `ubuntu-latest` daemon with the image built from the
 Dockerfile): the tools in the pod image, the contract of the pinned sidecar image (the `rootless` user, subuid and
